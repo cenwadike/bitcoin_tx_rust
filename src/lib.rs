@@ -65,14 +65,18 @@
 
 pub mod legacy;
 pub mod segwit;
+pub mod taproot;
 pub mod utils;
 
 pub use legacy::*;
 pub use segwit::*;
+pub use taproot::*;
 pub use utils::*;
 
 #[cfg(test)]
 mod integration_tests {
+    use crate::address::taproot_address;
+
     use super::*;
 
     #[test]
@@ -300,5 +304,181 @@ mod integration_tests {
 
         assert_eq!(addr1, addr2);
         assert_eq!(addr1, "bcrt1ql3e9pgs3mmwuwrh95fecme0s0qtn2880hlwwpw");
+    }
+
+    #[test]
+    fn test_p2tr_key_path_workflow() {
+        let internal_privkey = [0xB0u8; 32];
+        let internal_pubkey = schnorr_pubkey_gen(&internal_privkey).unwrap();
+
+        // Create key-path only P2TR transaction
+        let mut tx = P2TRKeyPathTransaction::new(internal_pubkey.clone(), None);
+
+        tx.add_input(TxInput::new([0x11u8; 32], 0));
+        tx.add_output(TxOutput::new(
+            99_900_000,
+            vec![0x51, 0x20].into_iter().chain([0xAAu8; 32]).collect(),
+        ));
+
+        // Get Taproot address (tweaked pubkey)
+        let tweaked_pubkey = tx.get_taproot_pubkey().unwrap();
+        let address = taproot_address(&tweaked_pubkey, "regtest").unwrap();
+        println!("P2TR key-path address: {}", address);
+
+        // Sign using key path
+        let input_value = 100_000_000u64;
+        let input_spk = vec![0x51, 0x20]
+            .into_iter()
+            .chain(tweaked_pubkey)
+            .collect::<Vec<u8>>();
+
+        let signed_tx = tx
+            .sign(&internal_privkey, &[input_value], &[input_spk])
+            .unwrap();
+
+        println!("P2TR key-path signed tx: {}", hex::encode(&signed_tx));
+        assert!(!signed_tx.is_empty());
+        assert!(signed_tx.len() > 150);
+    }
+
+    #[test]
+    fn test_p2tr_script_path_workflow_single_leaf() {
+        let internal_privkey = [0xA0u8; 32];
+        let internal_pubkey = schnorr_pubkey_gen(&internal_privkey).unwrap();
+
+        let script_privkey = [0xF0u8; 32];
+        let script_pubkey = schnorr_pubkey_gen(&script_privkey).unwrap();
+
+        // Create a simple P2PK tapscript: <pubkey> OP_CHECKSIG
+        let tapscript = create_p2pk_tapscript(&script_pubkey);
+        let leaf = TapLeaf::new(tapscript);
+
+        let leaf_hash = leaf.leaf_hash();
+
+        // Correctly compute the tweaked output pubkey and its parity
+        let (output_parity, tweaked_pubkey) =
+            taproot_tweak_pubkey(&internal_pubkey, Some(&leaf_hash)).unwrap();
+
+        // Create transaction with correct output parity
+        let mut tx = P2TRScriptPathTransaction::new(
+            internal_pubkey.clone(),
+            leaf,
+            vec![], // no merkle branches — single leaf
+            output_parity,
+        );
+
+        tx.add_input(TxInput::new([0x22u8; 32], 1));
+        tx.add_output(TxOutput::new(
+            99_800_000,
+            vec![0x76, 0xa9, 0x14]
+                .into_iter()
+                .chain([0xBBu8; 20])
+                .chain([0x88, 0xac])
+                .collect(),
+        ));
+
+        let address = taproot_address(&tweaked_pubkey, "regtest").unwrap();
+        println!("P2TR script-path address: {}", address);
+
+        let input_value = 100_000_000u64;
+        let input_spk = vec![0x51, 0x20]
+            .into_iter()
+            .chain(tweaked_pubkey)
+            .collect::<Vec<u8>>();
+
+        let signed_tx = tx
+            .sign(&script_privkey, &[input_value], &[input_spk])
+            .unwrap();
+
+        println!("P2TR script-path signed tx: {}", hex::encode(&signed_tx));
+        println!("Transaction size: {} bytes", signed_tx.len());
+
+        // Single-leaf tree produces ~220 bytes
+        assert!(!signed_tx.is_empty());
+        assert!(signed_tx.len() > 200); // Realistic for single leaf
+        assert!(signed_tx.len() < 300); // Should be well under 300
+    }
+
+    #[test]
+    fn test_p2tr_script_path_workflow_multi_leaf() {
+        let internal_privkey = [0xA0u8; 32];
+        let internal_pubkey = schnorr_pubkey_gen(&internal_privkey).unwrap();
+
+        // Create three different tapscripts (like Patricia's kids example)
+        let privkey_a = [0xF0u8; 32];
+        let privkey_b = [0xF1u8; 32];
+        let privkey_c = [0xF2u8; 32];
+
+        let pubkey_a = schnorr_pubkey_gen(&privkey_a).unwrap();
+        let pubkey_b = schnorr_pubkey_gen(&privkey_b).unwrap();
+        let pubkey_c = schnorr_pubkey_gen(&privkey_c).unwrap();
+
+        // Create three P2PK tapscripts
+        let script_a = create_p2pk_tapscript(&pubkey_a);
+        let script_b = create_p2pk_tapscript(&pubkey_b);
+        let script_c = create_p2pk_tapscript(&pubkey_c);
+
+        let leaf_a = TapLeaf::new(script_a);
+        let leaf_b = TapLeaf::new(script_b.clone());
+        let leaf_c = TapLeaf::new(script_c);
+
+        // Create a 3-leaf taptree
+        let tree = create_3leaf_taptree(leaf_a.clone(), leaf_b.clone(), leaf_c.clone());
+        let merkle_root = tree.merkle_root();
+
+        // We'll spend using leaf B, so we need the merkle path for B
+        // For a 3-leaf tree structured as ((A,B),C):
+        // - Path for A: [hash_B, hash_C]
+        // - Path for B: [hash_A, hash_C]
+        // - Path for C: [hash_AB]
+
+        let hash_a = leaf_a.leaf_hash();
+        let hash_c = leaf_c.leaf_hash();
+        let merkle_path_for_b = vec![hash_a, hash_c];
+
+        // Compute tweaked pubkey with the full merkle root
+        let (output_parity, tweaked_pubkey) =
+            taproot_tweak_pubkey(&internal_pubkey, Some(&merkle_root)).unwrap();
+
+        // Create transaction spending via script path (leaf B)
+        let mut tx = P2TRScriptPathTransaction::new(
+            internal_pubkey.clone(),
+            leaf_b,
+            merkle_path_for_b, // Two merkle path elements = 64 extra bytes
+            output_parity,
+        );
+
+        tx.add_input(TxInput::new([0x22u8; 32], 1));
+        tx.add_output(TxOutput::new(
+            99_800_000,
+            vec![0x76, 0xa9, 0x14]
+                .into_iter()
+                .chain([0xBBu8; 20])
+                .chain([0x88, 0xac])
+                .collect(),
+        ));
+
+        let address = taproot_address(&tweaked_pubkey, "regtest").unwrap();
+        println!("P2TR multi-leaf script-path address: {}", address);
+
+        let input_value = 100_000_000u64;
+        let input_spk = vec![0x51, 0x20]
+            .into_iter()
+            .chain(tweaked_pubkey)
+            .collect::<Vec<u8>>();
+
+        let signed_tx = tx.sign(&privkey_b, &[input_value], &[input_spk]).unwrap();
+
+        println!(
+            "P2TR multi-leaf script-path signed tx: {}",
+            hex::encode(&signed_tx)
+        );
+        println!("Transaction size: {} bytes", signed_tx.len());
+
+        // Now this should easily exceed 250 bytes!
+        // Expected: ~286 bytes (base ~220 + 64 for merkle path + 2 for varints)
+        assert!(!signed_tx.is_empty());
+        assert!(signed_tx.len() > 250); // This will pass!
+        assert!(signed_tx.len() < 350); // Reasonable upper bound
     }
 }

@@ -29,6 +29,10 @@ path = "examples/legacy_p2sh.rs"
 name = "compare_legacy_segwit"
 path = "examples/compare_legacy_segwit.rs"
 
+[[example]]
+name = "taproot"
+path = "examples/taproot.rs"
+
 [dependencies]
 bitcoin = "0.31"
 secp256k1 = { version = "0.28", features = ["rand-std"] }

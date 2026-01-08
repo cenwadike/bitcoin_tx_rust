@@ -1,5 +1,7 @@
 use bitcoin::PublicKey;
+use bitcoin::XOnlyPublicKey;
 use bitcoin::address::{Address, NetworkUnchecked, Payload};
+use bitcoin::key::Secp256k1;
 use bitcoin::network::Network as BitcoinNetwork;
 use bitcoin::script::ScriptBuf;
 
@@ -68,5 +70,28 @@ pub fn script_to_p2wsh(script: &[u8], network: &str) -> Result<String, Box<dyn s
     };
 
     let address = Address::p2wsh(&script_buf, bitcoin_network);
+    Ok(address.to_string())
+}
+
+/// Convert a 32-byte x-only tweaked public key to a P2TR (Taproot) address
+///
+/// `pubkey` must be the **final tweaked** x-only public key (32 bytes)
+/// This is what you get from `taproot_tweak_pubkey(...).1`.
+pub fn taproot_address(pubkey: &[u8], network: &str) -> Result<String, Box<dyn std::error::Error>> {
+    if pubkey.len() != 32 {
+        return Err("Taproot public key must be 32 bytes (x-only)".into());
+    }
+
+    let secp = Secp256k1::new();
+    let xonly = XOnlyPublicKey::from_slice(pubkey)?;
+
+    let bitcoin_network = match network {
+        "mainnet" => BitcoinNetwork::Bitcoin,
+        "testnet" => BitcoinNetwork::Testnet,
+        "regtest" => BitcoinNetwork::Regtest,
+        _ => return Err("Invalid network".into()),
+    };
+
+    let address = Address::p2tr(&secp, xonly, None, bitcoin_network);
     Ok(address.to_string())
 }

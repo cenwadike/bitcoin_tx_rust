@@ -41,11 +41,46 @@ pub fn varint_len(data: &[u8]) -> Vec<u8> {
     }
 }
 
+// Encode a variable length integer (varint) for u64
+pub fn varint_encode(n: u64) -> Vec<u8> {
+    if n < 0xfd {
+        vec![n as u8]
+    } else if n <= 0xffff {
+        let mut v = vec![0xfd];
+        v.extend_from_slice(&(n as u16).to_le_bytes());
+        v
+    } else if n <= 0xffffffff {
+        let mut v = vec![0xfe];
+        v.extend_from_slice(&(n as u32).to_le_bytes());
+        v
+    } else {
+        let mut v = vec![0xff];
+        v.extend_from_slice(&n.to_le_bytes());
+        v
+    }
+}
+
 /// Create a push bytes operation with length prefix
 pub fn pushbytes(data: &[u8]) -> Vec<u8> {
     let mut result = varint_len(data);
     result.extend_from_slice(data);
     result
+}
+
+/// Compute a BIP-341 style tagged hash: SHA256(SHA256(tag) || SHA256(tag) || data)
+pub fn tagged_hash(tag: &str, data: &[u8]) -> [u8; 32] {
+    let tag_bytes = tag.as_bytes();
+    let tag_hash = Sha256::digest(tag_bytes);
+
+    let mut hasher = Sha256::new();
+    hasher.update(&tag_hash);
+    hasher.update(&tag_hash); // double SHA256(tag)
+    hasher.update(data);
+
+    let result = hasher.finalize();
+    let mut output = [0u8; 32];
+    output.copy_from_slice(&result);
+    output
 }
 
 #[cfg(test)]
