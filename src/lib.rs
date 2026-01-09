@@ -80,6 +80,7 @@
 
 pub mod flags;
 pub mod legacy;
+pub mod psbt;
 pub mod segwit;
 pub mod taproot;
 pub mod timelocks;
@@ -88,6 +89,7 @@ pub mod utils;
 
 pub use flags::*;
 pub use legacy::*;
+pub use psbt::*;
 pub use segwit::*;
 pub use taproot::*;
 pub use timelocks::*;

@@ -5,7 +5,7 @@
 use crate::sighash::{SegwitV0Sighash, SighashFlag, SighashInput, SighashOutput};
 use crate::timelocks::{LockTime, OpCheckLockTimeVerify, OpCheckSequenceVerify, Sequence};
 use crate::transaction::*;
-use crate::utils::*;
+use crate::{serialize_varint, utils::*};
 
 /// P2WPKH Transaction with full trait support
 #[derive(Debug, Clone)]
@@ -58,6 +58,44 @@ impl P2WPKHTransaction {
             amount,
             script_pubkey,
         });
+    }
+
+    pub fn build_unsigned(&self) -> Vec<u8> {
+        let mut tx = Vec::new();
+
+        // Version
+        tx.extend_from_slice(&self.version.to_le_bytes());
+
+        // Input count
+        tx.extend_from_slice(&serialize_varint(self.inputs.len()));
+
+        // Inputs (without witness)
+        for input in &self.inputs {
+            let mut txid = input.txid;
+            txid.reverse(); // txid is little-endian in wire format
+            tx.extend_from_slice(&txid);
+            tx.extend_from_slice(&input.vout.to_le_bytes());
+
+            // Empty scriptSig for SegWit
+            tx.push(0x00);
+
+            tx.extend_from_slice(&input.sequence.to_bytes());
+        }
+
+        // Output count
+        tx.extend_from_slice(&&serialize_varint(self.outputs.len()));
+
+        // Outputs
+        for output in &self.outputs {
+            tx.extend_from_slice(&output.amount.to_le_bytes());
+            tx.extend_from_slice(&&serialize_varint(output.script_pubkey.len()));
+            tx.extend_from_slice(&output.script_pubkey);
+        }
+
+        // Locktime
+        tx.extend_from_slice(&self.locktime.to_bytes());
+
+        tx
     }
 
     /// Sign the transaction using the configured sighash flags
