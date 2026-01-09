@@ -11,6 +11,7 @@ A comprehensive, production-ready Bitcoin transaction library with trait-based a
 - **Legacy Transactions**: P2PKH, P2SH multisig (2-of-2, 2-of-3, m-of-n)
 - **SegWit Transactions**: P2WPKH (single/multi-input), P2WSH multisig
 - **Taproot Transactions**: P2TR (key-path and script-path spending)
+- **PSBT (Partially Signed Bitcoin Transactions)** support
 
 ### 🎯 Advanced Features
 - **Custom Sighash Flags**: ALL, NONE, SINGLE, and ANYONECANPAY variants per input
@@ -600,7 +601,6 @@ This library is designed for educational purposes and research. While the code f
 
 ## 🗺️ Roadmap
 
-- [ ] PSBT (Partially Signed Bitcoin Transactions) support
 - [ ] Hardware wallet integration
 - [ ] Performance benchmarks
 - [ ] Fuzzing tests

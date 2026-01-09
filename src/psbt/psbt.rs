@@ -161,8 +161,23 @@ pub struct Psbt {
 impl Psbt {
     /// Create a new PSBT from an unsigned transaction
     pub fn new(unsigned_tx: Vec<u8>) -> Result<Self, PsbtError> {
-        // Parse transaction to get input/output counts
+        // At minimum, check version + some structure
+        if unsigned_tx.len() < 10 {
+            return Err(PsbtError::InvalidTransaction);
+        }
+
+        // Very important: check that it's NOT a witness transaction
+        // (version + 00 01 flag is invalid for PSBT unsigned tx)
+        if unsigned_tx.len() >= 6 && unsigned_tx[4] == 0x00 && unsigned_tx[5] == 0x01 {
+            return Err(PsbtError::InvalidTransaction); // witness flag not allowed in PSBT
+        }
+
         let (input_count, output_count) = Self::parse_tx_counts(&unsigned_tx)?;
+
+        // Optional but recommended: very basic sanity check
+        if input_count == 0 || output_count == 0 {
+            return Err(PsbtError::InvalidTransaction);
+        }
 
         Ok(Self {
             global: PsbtGlobal {
@@ -1520,29 +1535,261 @@ fn serialize_pushdata(data: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_psbt_creation() {
-        // Minimal invalid tx for testing
-        let unsigned_tx = vec![0x02, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00];
-        let result = Psbt::new(unsigned_tx.clone());
-        assert!(result.is_err()); // Invalid tx, but for count it's ok? Wait, adjust test
+    // Helper to create a minimal valid unsigned transaction (1 in, 1 out)
+    fn minimal_unsigned_tx() -> Vec<u8> {
+        vec![
+            0x01, 0x00, 0x00, 0x00, // version
+            0x01, // input count
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, // txid
+            0x00, 0x00, 0x00, 0x00, // vout
+            0x00, // scriptSig len = 0
+            0xff, 0xff, 0xff, 0xff, // sequence
+            0x01, // output count
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 0 sat
+            0x00, // scriptPubKey len = 0
+            0x00, 0x00, 0x00, 0x00, // locktime
+        ]
     }
 
-    // Add more tests for serialize, deserialize, combine, etc.
-    // For example:
+    #[test]
+    fn test_deserialize_invalid_magic() {
+        let invalid = b"psbx\xff...";
+        assert!(Psbt::deserialize(invalid).is_err());
+        assert_eq!(
+            Psbt::deserialize(invalid).unwrap_err(),
+            PsbtError::InvalidMagic
+        );
+    }
+
+    #[test]
+    fn test_deserialize_missing_unsigned_tx() {
+        let mut data = vec![];
+        data.extend_from_slice(PSBT_MAGIC); // "psbt"
+        data.push(PSBT_SEPARATOR); // 0xff
+
+        // Add only version, no unsigned tx
+        let version_key = vec![0xfb];
+        let version_value = 2u32.to_le_bytes().to_vec(); // e.g. version 2
+
+        serialize_kv(&mut data, &version_key, &version_value);
+
+        data.push(0x00); // end of global
+
+        // No inputs/outputs needed for this test
+
+        let err = Psbt::deserialize(&data).unwrap_err();
+
+        assert_eq!(
+            err,
+            PsbtError::MissingUnsignedTx,
+            "Should fail because unsigned transaction is missing"
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_with_partial_sig_and_derivation() {
+        let mut psbt = Psbt::new(minimal_unsigned_tx()).unwrap();
+
+        // Add partial signature + bip32 derivation to input 0
+        let pubkey = [vec![0x02], vec![0x22; 32]].concat();
+        let sig = [vec![0x30], vec![0x44; 69]].concat(); // fake DER sig
+
+        psbt.add_partial_sig(0, pubkey.clone(), sig.clone())
+            .unwrap();
+
+        let fingerprint = [0x12, 0x34, 0x56, 0x78];
+        let path = vec![44, 0, 0, 0, 0];
+        psbt.add_input_bip32_derivation(0, pubkey.clone(), fingerprint, path.clone())
+            .unwrap();
+
+        // Round-trip
+        let serialized = psbt.serialize();
+        let deserialized = Psbt::deserialize(&serialized).unwrap();
+
+        assert_eq!(psbt.global.unsigned_tx, deserialized.global.unsigned_tx);
+        assert_eq!(
+            psbt.inputs[0].partial_sigs.get(&pubkey),
+            deserialized.inputs[0].partial_sigs.get(&pubkey)
+        );
+        assert_eq!(
+            psbt.inputs[0].bip32_derivation.get(&pubkey),
+            deserialized.inputs[0].bip32_derivation.get(&pubkey)
+        );
+    }
+
+    #[test]
+    fn test_combine_success_same_tx() {
+        let tx = minimal_unsigned_tx();
+
+        let mut psbt1 = Psbt::new(tx.clone()).unwrap();
+        let mut psbt2 = Psbt::new(tx.clone()).unwrap();
+
+        // Different pieces of information
+        psbt1
+            .add_partial_sig(0, vec![0x03; 33], vec![0x30; 72])
+            .unwrap();
+        psbt2
+            .set_witness_utxo(0, 100_000, [vec![0x00, 0x14], vec![0x12; 20]].concat())
+            .unwrap();
+
+        psbt1.combine(&psbt2).unwrap();
+
+        assert!(psbt1.inputs[0].partial_sigs.len() == 1);
+        assert!(psbt1.inputs[0].witness_utxo.is_some());
+    }
+
+    #[test]
+    fn test_combine_conflict_detection() {
+        let tx = minimal_unsigned_tx();
+
+        let mut psbt1 = Psbt::new(tx.clone()).unwrap();
+        let mut psbt2 = Psbt::new(tx.clone()).unwrap();
+
+        // Same field, different value → conflict
+        psbt1.global.version = Some(0);
+        psbt2.global.version = Some(2);
+
+        let result = psbt1.combine(&psbt2);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), PsbtError::ConflictingData);
+    }
+
+    #[test]
+    fn test_combine_different_transactions() {
+        let tx1 = minimal_unsigned_tx();
+        let mut tx2 = minimal_unsigned_tx();
+        tx2[4] = 0x02; // different version → different tx
+
+        // Create first real PSBT
+        let mut psbt1 = Psbt::new(tx1.clone()).unwrap();
+
+        // Create fake second PSBT with different unsigned_tx (don't use new())
+        let psbt2 = Psbt {
+            global: PsbtGlobal {
+                unsigned_tx: tx2,
+                version: Some(0),
+                xpubs: BTreeMap::new(),
+                proprietary: BTreeMap::new(),
+                unknown: BTreeMap::new(),
+            },
+            inputs: vec![PsbtInput::new(); 1],
+            outputs: vec![PsbtOutput::new(); 1],
+        };
+
+        let result = psbt1.combine(&psbt2);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), PsbtError::DifferentTransactions);
+    }
+
+    #[test]
+    fn test_finalize_p2wpkh_single_sig() {
+        let mut psbt = Psbt::new(minimal_unsigned_tx()).unwrap();
+
+        let pubkey = vec![0x02; 33];
+        let sig = vec![0x30; 72];
+
+        psbt.set_witness_utxo(0, 50000, [vec![0x00], vec![0x14; 21]].concat())
+            .unwrap();
+        psbt.add_partial_sig(0, pubkey.clone(), sig.clone())
+            .unwrap();
+
+        psbt.finalize_input(0).unwrap();
+
+        let witness = psbt.inputs[0].final_script_witness.as_ref().unwrap();
+        assert_eq!(witness.len(), 2);
+        assert_eq!(witness[0], sig);
+        assert_eq!(witness[1], pubkey);
+    }
+
+    #[test]
+    fn test_finalize_legacy_p2pkh() {
+        let mut psbt = Psbt::new(minimal_unsigned_tx()).unwrap();
+
+        let pubkey = vec![0x02; 33];
+        let sig = vec![0x30; 72];
+
+        psbt.set_non_witness_utxo(0, [vec![0x01, 0x00, 0x00], vec![0x00; 9]].concat())
+            .unwrap();
+        psbt.add_partial_sig(0, pubkey.clone(), sig.clone())
+            .unwrap();
+
+        psbt.finalize_input(0).unwrap();
+
+        assert!(psbt.inputs[0].final_script_sig.is_some());
+        assert!(psbt.inputs[0].final_script_sig.as_ref().unwrap().len() > 100);
+    }
+
+    #[test]
+    fn test_finalize_cannot_finalize_no_data() {
+        let mut psbt = Psbt::new(minimal_unsigned_tx()).unwrap();
+        let result = psbt.finalize_input(0);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), PsbtError::CannotFinalize);
+    }
+
+    #[test]
+    fn test_extract_tx_basic() {
+        let mut psbt = Psbt::new(minimal_unsigned_tx()).unwrap();
+
+        // Fake finalization
+        psbt.inputs[0].final_script_sig = Some([vec![0x76, 0xa9], vec![0x14; 24]].concat());
+
+        let extracted = psbt.extract_tx().unwrap();
+
+        // Very basic check - at least longer than original
+        assert!(extracted.len() > minimal_unsigned_tx().len());
+        assert_eq!(&extracted[0..4], &[0x01, 0x00, 0x00, 0x00]); // version
+    }
+
+    #[test]
+    fn test_psbt_creation() {
+        // Real minimal valid transaction (1 input, 1 output, no witness)
+        let valid_tx = vec![
+            0x01, 0x00, 0x00, 0x00, // version
+            0x01, // input count = 1
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, // txid
+            0x00, 0x00, 0x00, 0x00, // vout
+            0x00, // scriptSig len = 0
+            0xff, 0xff, 0xff, 0xff, // sequence
+            0x01, // output count = 1
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 0 sat
+            0x00, // scriptPubKey len = 0
+            0x00, 0x00, 0x00, 0x00, // locktime
+        ];
+
+        let psbt = Psbt::new(valid_tx).expect("Should create PSBT from valid tx");
+        assert_eq!(psbt.inputs.len(), 1);
+        assert_eq!(psbt.outputs.len(), 1);
+    }
+
     #[test]
     fn test_serialize_deserialize() {
         let unsigned_tx = vec![
-            0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x01, 0x00, 0x00, 0x00, // version 1
+            0x01, // 1 input
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, // dummy txid
+            0x00, 0x00, 0x00, 0x00, // vout 0
+            0x00, // scriptSig len = 0
+            0xff, 0xff, 0xff, 0xff, // sequence
+            0x01, // 1 output
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 0 satoshis
+            0x00, // scriptPubKey len = 0
+            0x00, 0x00, 0x00, 0x00, // locktime
         ];
-        let psbt = Psbt::new(unsigned_tx).unwrap();
+
+        let psbt = Psbt::new(unsigned_tx.clone()).expect("Valid minimal tx should work");
+
         let serialized = psbt.serialize();
-        let deserialized = Psbt::deserialize(&serialized).unwrap();
+        let deserialized = Psbt::deserialize(&serialized).expect("Should deserialize back");
+
         assert_eq!(psbt.global.unsigned_tx, deserialized.global.unsigned_tx);
-        // Add assertions for other fields
+        assert_eq!(psbt.inputs.len(), deserialized.inputs.len());
+        assert_eq!(psbt.outputs.len(), deserialized.outputs.len());
     }
 }
