@@ -1,21 +1,18 @@
-//! Bitcoin Core Integration Test
+//! examples/bitcoin_core_test.rs
 //!
-//! This example demonstrates how to create transactions that can be broadcast
-//! to a local Bitcoin Core node running in regtest mode.
+//! Integration test: Create & broadcast real transactions to local Bitcoin Core regtest
 //!
 //! Prerequisites:
-//! 1. Bitcoin Core installed
-//! 2. Run: bitcoind -regtest -daemon
-//! 3. Create wallet: bitcoin-cli -regtest createwallet "test"
-//! 4. Generate blocks: bitcoin-cli -regtest generatetoaddress 101 $(bitcoin-cli -regtest getnewaddress)
+//! 1. bitcoind -regtest -daemon
+//! 2. bitcoin-cli -regtest createwallet "test"
+//! 3. bitcoin-cli -regtest generatetoaddress 101 $(bitcoin-cli -regtest getnewaddress)
 
 use bitcoin_tx_rust::*;
 use std::process::Command;
 
 fn main() {
-    println!("=== Bitcoin Core Integration Test ===\n");
+    println!("=== Bitcoin Core Integration Test (Regtest) ===\n");
 
-    // Check if Bitcoin Core is running
     if !check_bitcoin_core() {
         eprintln!("Error: Bitcoin Core not running in regtest mode");
         eprintln!("Start it with: bitcoind -regtest -daemon");
@@ -24,10 +21,9 @@ fn main() {
 
     println!("✓ Bitcoin Core is running\n");
 
-    // Example 1: Create and fund a P2WPKH address
     example_create_and_fund_p2wpkh();
 
-    // Example 2: Spend from a funded address
+    // Uncomment once you have real UTXO data from 'listunspent'
     // example_spend_p2wpkh();
 }
 
@@ -60,90 +56,88 @@ fn bitcoin_cli(args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
 }
 
 fn example_create_and_fund_p2wpkh() {
-    println!("Example 1: Create and Fund P2WPKH Address");
-    println!("==========================================\n");
+    println!("Example 1: Create & Fund Native P2WPKH Address");
+    println!("==============================================\n");
 
-    // Generate keys
     let privkey = [0x11u8; 32];
     let pubkey = privkey_to_pubkey(&privkey).unwrap();
     let address = pk_to_p2wpkh(&pubkey, "regtest").unwrap();
 
     println!("Generated address: {}", address);
-    println!("Private key: {}", hex::encode(&privkey));
-    println!("Public key: {}", hex::encode(&pubkey));
+    println!("Private key (hex): {}", hex::encode(&privkey));
+    println!("Public key (hex): {}", hex::encode(&pubkey));
 
-    // Fund the address
     println!("\nFunding address with 2.001 BTC...");
     match bitcoin_cli(&["sendtoaddress", &address, "2.001"]) {
         Ok(txid) => {
             println!("✓ Funded! TXID: {}", txid);
 
-            // Mine a block to confirm
+            // Mine 1 block to confirm
             match bitcoin_cli(&["getnewaddress"]) {
-                Ok(mining_addr) => match bitcoin_cli(&["generatetoaddress", "1", &mining_addr]) {
-                    Ok(_) => println!("✓ Transaction confirmed"),
-                    Err(e) => println!("Warning: Could not mine block: {}", e),
-                },
-                Err(e) => println!("Warning: Could not get mining address: {}", e),
-            }
-
-            // Get transaction details
-            println!("\nTransaction details:");
-            if let Ok(raw_tx) = bitcoin_cli(&["getrawtransaction", &txid]) {
-                if let Ok(decoded) = bitcoin_cli(&["decoderawtransaction", &raw_tx]) {
-                    // Parse and find our output
-                    println!("{}", decoded);
+                Ok(mining_addr) => {
+                    let _ = bitcoin_cli(&["generatetoaddress", "1", &mining_addr]);
+                    println!("✓ Mined 1 block → transaction confirmed");
                 }
+                Err(e) => println!("Warning: Could not mine block: {}", e),
             }
         }
         Err(e) => {
             println!("Error funding address: {}", e);
-            println!("Make sure you have:");
-            println!("  1. Created a wallet: bitcoin-cli -regtest createwallet \"test\"");
+            println!("\nFixes:");
+            println!("  bitcoin-cli -regtest createwallet \"test\"");
             println!(
-                "  2. Generated blocks: bitcoin-cli -regtest generatetoaddress 101 $(bitcoin-cli -regtest getnewaddress)"
+                "  bitcoin-cli -regtest generatetoaddress 101 $(bitcoin-cli -regtest getnewaddress)"
             );
         }
     }
 }
-
 #[allow(dead_code)]
 fn example_spend_p2wpkh() {
-    println!("\n\nExample 2: Spend from P2WPKH Address");
-    println!("======================================\n");
+    println!("\nExample 2: Spend from Funded P2WPKH Address");
+    println!("==========================================\n");
 
-    // This would use actual UTXO from Bitcoin Core
     let sender_privkey = [0x11u8; 32];
     let sender_pubkey = privkey_to_pubkey(&sender_privkey).unwrap();
 
-    // Create transaction (you'd need to get real UTXO info from Bitcoin Core)
+    // !!! REPLACE THESE WITH REAL DATA FROM YOUR NODE !!!
+    // Command: bitcoin-cli -regtest listunspent
+    let real_txid_hex = "REPLACE_WITH_REAL_TXID"; // e.g. "d4ce50311efa12a97b6c910afba180686687edae..."
+    let real_vout: u32 = 0; // usually 0 or 1
+    let real_amount_sat: u64 = 200_100_000; // must match actual UTXO amount
+
+    // Real input script_pubkey = OP_0 PUSH20 <hash160(pubkey)>
+    let input_script_pubkey = vec![
+        0x00, 0x14, // OP_0 PUSH20
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, // ← replace with real hash160(pubkey)
+    ];
+
     let mut tx = P2WPKHTransaction::new();
 
-    // Example TXID (replace with real one)
-    let txid_hex = "0000000000000000000000000000000000000000000000000000000000000000";
-    let mut txid = [0u8; 32];
-    hex::decode_to_slice(txid_hex, &mut txid).unwrap();
+    // Correct order: txid, vout, script_pubkey, amount
+    let txid_bytes = hex::decode(real_txid_hex).expect("Invalid txid hex");
+    let txid: [u8; 32] = txid_bytes.try_into().expect("Txid must be 32 bytes");
 
-    tx.add_input(TxInput::new(txid, 0));
+    tx.add_input(txid, real_vout, input_script_pubkey, real_amount_sat);
 
-    // Receiver address
-    let receiver_address = "bcrt1q6mlqttg852e63uahyglwla55xusryqp08vx9w2";
+    // Receiver output
+    let receiver_address = "bcrt1ql3e9pgs3mmwuwrh95fecme0s0qtn2880hlwwpw";
     let receiver_spk = bech32_to_spk("bcrt", receiver_address).unwrap();
-    tx.add_output(TxOutput::new(100_000_000, receiver_spk));
+    tx.add_output(100_000_000, receiver_spk);
 
-    // Change
+    // Change output back to sender
     let change_pk_hash = hash160(&sender_pubkey);
     let mut change_spk = vec![0x00, 0x14];
     change_spk.extend_from_slice(&change_pk_hash);
-    tx.add_output(TxOutput::new(99_900_000, change_spk));
+    tx.add_output(99_900_000, change_spk);
 
-    // Sign
-    let signed_tx = tx
-        .sign(&sender_privkey, &sender_pubkey, 200_000_000)
-        .unwrap();
+    // Sign (single input → single key)
+    let signed_tx = tx.sign(&[sender_privkey]).unwrap();
     let tx_hex = hex::encode(&signed_tx);
 
-    println!("Signed transaction: {}", tx_hex);
-    println!("\nTo broadcast:");
+    println!("Signed transaction hex:\n{}", tx_hex);
+    println!("Size: {} bytes\n", signed_tx.len());
+
+    println!("To broadcast:");
     println!("  bitcoin-cli -regtest sendrawtransaction {}", tx_hex);
 }

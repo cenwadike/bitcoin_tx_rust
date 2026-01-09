@@ -1,151 +1,118 @@
-//! Legacy P2SH Multisig Transaction Example
+//! examples/legacy_p2sh.rs
 //!
-//! This demonstrates creating a P2SH (Pay-to-Script-Hash) multisig transaction
-//! in the legacy (pre-SegWit) format.
+//! Demonstrates creating and signing legacy P2SH (Pay-to-Script-Hash) multisig transactions:
+//!   • 2-of-2 multisig
+//!   • 2-of-3 multisig (using only 2 keys to spend)
 
 use bitcoin_tx_rust::*;
 
 fn main() {
-    println!("=== Legacy P2SH Multisig Transaction Example ===\n");
+    println!("=== Legacy P2SH Multisig Transaction Examples ===\n");
 
     example_2of2_p2sh();
     example_2of3_p2sh();
 }
 
 fn example_2of2_p2sh() {
-    println!("1. Creating a 2-of-2 P2SH Multisig Transaction");
-    println!("----------------------------------------------");
+    println!("1. 2-of-2 P2SH Multisig");
+    println!("---------------------");
 
-    // Create three private keys
     let privkey1 = [0x11u8; 32];
     let privkey2 = [0x22u8; 32];
 
-    // Derive public keys
     let pubkey1 = privkey_to_pubkey(&privkey1).unwrap();
     let pubkey2 = privkey_to_pubkey(&privkey2).unwrap();
 
     println!("Public key 1: {}", hex::encode(&pubkey1));
     println!("Public key 2: {}", hex::encode(&pubkey2));
 
-    // Create 2-of-2 multisig redeem script
     let redeem_script =
         legacy::P2SHMultisigTransaction::create_2of2_redeem_script(&pubkey1, &pubkey2);
-
     println!("\nRedeem script: {}", hex::encode(&redeem_script));
-    println!("Redeem script length: {} bytes", redeem_script.len());
 
-    // Convert to P2SH address
     let p2sh_address = legacy::P2SHMultisigTransaction::script_to_p2sh(&redeem_script, "regtest");
     println!("P2SH address: {}", p2sh_address);
 
-    // This address can now be funded using:
-    // bitcoin-cli -regtest sendtoaddress <address> 2.001
+    println!("\nCreating spending tx...");
 
-    println!("\n--- Creating spending transaction ---");
-
-    // Create transaction spending from the multisig
     let mut tx = legacy::P2SHMultisigTransaction::new(redeem_script);
 
-    // Simulated funding TXID (would be real in production)
+    // Funding UTXO (simulated)
     let funding_txid = [
         0x70, 0xcf, 0xb9, 0x92, 0xf5, 0x2c, 0x4f, 0xc5, 0x17, 0xf7, 0xde, 0xa0, 0x10, 0xf5, 0x95,
         0x7e, 0x07, 0xa0, 0x03, 0x48, 0x15, 0x55, 0x35, 0x4e, 0xa7, 0x22, 0x87, 0xd1, 0x3f, 0xc3,
         0x60, 0x2a,
     ];
 
-    tx.add_input(TxInput::new(funding_txid, 0));
+    // Correct add_input: txid, vout, amount
+    tx.add_input(funding_txid, 0, 200_000_000);
 
-    // Output 1: Send 1.5 BTC to receiver
+    // Receiver output
     let receiver_spk = hex::decode("76a9143bc28d6d92d9073fb5e3adf481795eaf446bceed88ac").unwrap();
-    tx.add_output(TxOutput::new(150_000_000, receiver_spk));
+    tx.add_output(150_000_000, receiver_spk);
 
-    // Output 2: Send 0.5 BTC change
+    // Change output
     let change_spk = hex::decode("76a914cc1b07838e387deacd0e5232e1e8b49f4c29e48488ac").unwrap();
-    tx.add_output(TxOutput::new(50_000_000, change_spk));
+    tx.add_output(50_000_000, change_spk);
 
-    // Build unsigned transaction
-    let unsigned = tx.build_unsigned();
-    println!("Unsigned transaction: {}", hex::encode(&unsigned));
+    // Sign (pass vector of key sets — one vec per input)
+    let signing_keys = vec![vec![privkey1, privkey2]]; // single input, needs both keys
 
-    // Sign with both private keys
-    let signed_tx = tx.sign(&[privkey1, privkey2], 0).unwrap();
-    println!("\nSigned transaction: {}", hex::encode(&signed_tx));
-    println!("Transaction size: {} bytes", signed_tx.len());
+    let signed_tx = tx.sign(&signing_keys).unwrap();
 
-    println!("\nTo broadcast:");
+    println!("Signed tx size: {} bytes", signed_tx.len());
+    println!("Signed tx hex: {}", hex::encode(&signed_tx));
+
     println!(
-        "  bitcoin-cli -regtest sendrawtransaction {}",
+        "\nTo broadcast: bitcoin-cli -regtest sendrawtransaction {}\n",
         hex::encode(&signed_tx)
     );
 }
 
 fn example_2of3_p2sh() {
-    println!("\n\n2. Creating a 2-of-3 P2SH Multisig Transaction");
-    println!("----------------------------------------------");
+    println!("2. 2-of-3 P2SH Multisig (spend with only 2 keys)");
+    println!("--------------------------------------------");
 
-    // Create three private keys
     let privkey1 = [0x11u8; 32];
     let privkey2 = [0x22u8; 32];
     let privkey3 = [0x33u8; 32];
 
-    // Derive public keys
     let pubkey1 = privkey_to_pubkey(&privkey1).unwrap();
     let pubkey2 = privkey_to_pubkey(&privkey2).unwrap();
     let pubkey3 = privkey_to_pubkey(&privkey3).unwrap();
 
-    println!("Public key 1: {}", hex::encode(&pubkey1));
-    println!("Public key 2: {}", hex::encode(&pubkey2));
-    println!("Public key 3: {}", hex::encode(&pubkey3));
-
-    // Create 2-of-3 multisig redeem script
     let redeem_script =
         legacy::P2SHMultisigTransaction::create_2of3_redeem_script(&pubkey1, &pubkey2, &pubkey3);
-
     println!("\nRedeem script: {}", hex::encode(&redeem_script));
-    println!("Redeem script structure:");
-    println!("  OP_2 (0x52): Requires 2 signatures");
-    println!("  <pubkey1>");
-    println!("  <pubkey2>");
-    println!("  <pubkey3>");
-    println!("  OP_3 (0x53): Total of 3 public keys");
-    println!("  OP_CHECKMULTISIG (0xae)");
 
-    // Convert to P2SH address
     let p2sh_address = legacy::P2SHMultisigTransaction::script_to_p2sh(&redeem_script, "regtest");
-    println!("\nP2SH address: {}", p2sh_address);
-    println!(
-        "Fund this address with: bitcoin-cli -regtest sendtoaddress {} 2.001",
-        p2sh_address
-    );
+    println!("P2SH address: {}", p2sh_address);
 
-    println!("\n--- Creating spending transaction (using 2 of 3 keys) ---");
+    println!("\nCreating spending tx...");
 
-    // Create transaction
     let mut tx = legacy::P2SHMultisigTransaction::new(redeem_script);
 
-    // Simulated funding TXID
     let funding_txid = [
         0x70, 0xcf, 0xb9, 0x92, 0xf5, 0x2c, 0x4f, 0xc5, 0x17, 0xf7, 0xde, 0xa0, 0x10, 0xf5, 0x95,
         0x7e, 0x07, 0xa0, 0x03, 0x48, 0x15, 0x55, 0x35, 0x4e, 0xa7, 0x22, 0x87, 0xd1, 0x3f, 0xc3,
         0x60, 0x2a,
     ];
 
-    tx.add_input(TxInput::new(funding_txid, 0));
+    tx.add_input(funding_txid, 0, 200_000_000);
 
-    // Outputs
     let receiver_spk = hex::decode("76a9143bc28d6d92d9073fb5e3adf481795eaf446bceed88ac").unwrap();
-    tx.add_output(TxOutput::new(150_000_000, receiver_spk));
+    tx.add_output(150_000_000, receiver_spk);
 
     let change_spk = hex::decode("76a914cc1b07838e387deacd0e5232e1e8b49f4c29e48488ac").unwrap();
-    tx.add_output(TxOutput::new(50_000_000, change_spk));
+    tx.add_output(50_000_000, change_spk);
 
-    // Sign with first 2 keys only (we only need 2 of 3)
-    println!("\nSigning with private keys 1 and 2 (key 3 not needed)...");
-    let signed_tx = tx.sign(&[privkey1, privkey2], 0).unwrap();
+    // Sign with only 2 keys (2-of-3 — we don't need the 3rd)
+    let signing_keys = vec![vec![privkey1, privkey2]];
 
-    println!("Signed transaction: {}", hex::encode(&signed_tx));
-    println!("Transaction size: {} bytes", signed_tx.len());
+    let signed_tx = tx.sign(&signing_keys).unwrap();
 
-    println!("\n✓ Successfully created 2-of-3 multisig transaction!");
-    println!("Note: Any 2 of the 3 keys can be used to sign");
+    println!("Signed tx size: {} bytes", signed_tx.len());
+    println!("Signed tx hex: {}", hex::encode(&signed_tx));
+
+    println!("\n✓ 2-of-3 multisig spending successful using only 2 keys!\n");
 }

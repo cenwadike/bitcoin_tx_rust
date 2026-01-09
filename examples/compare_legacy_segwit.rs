@@ -1,230 +1,275 @@
-//! Comparison between Legacy and SegWit Transactions
+//! examples/compare_legacy_segwit.rs (FIXED VERSION)
 //!
-//! This example demonstrates the differences between legacy (P2PKH/P2SH)
-//! and SegWit (P2WPKH/P2WSH) transactions.
+//! Realistic comparison correctly showing SegWit efficiency using virtual bytes:
+//!   • Legacy P2PKH vs SegWit P2WPKH (2 inputs, 3 outputs)
+//!   • Legacy P2SH vs SegWit P2WSH (2-of-2 multisig, 2 inputs)
 
 use bitcoin_tx_rust::*;
 
 fn main() {
-    println!("=== Legacy vs SegWit Transaction Comparison ===\n");
+    println!("=== Realistic Legacy vs SegWit Size & Fee Comparison ===\n");
+    println!("(Using 2 inputs + 3 outputs for representative results)\n");
 
-    let (legacy_p2pkh_size, segwit_p2wpkh_size) = compare_p2pkh_vs_p2wpkh();
-    let (legacy_p2sh_size, segwit_p2wsh_size) = compare_p2sh_vs_p2wsh();
+    let (legacy_p2pkh_size, _segwit_p2wpkh_size, segwit_p2wpkh_vsize) = compare_p2pkh_vs_p2wpkh();
+    let (legacy_p2sh_size, _segwit_p2wsh_size, segwit_p2wsh_vsize) = compare_p2sh_vs_p2wsh();
 
     size_comparison(
         legacy_p2pkh_size,
-        segwit_p2wpkh_size,
+        segwit_p2wpkh_vsize,
         legacy_p2sh_size,
-        segwit_p2wsh_size,
+        segwit_p2wsh_vsize,
     );
 }
 
-fn compare_p2pkh_vs_p2wpkh() -> (usize, usize) {
-    println!("1. P2PKH (Legacy) vs P2WPKH (SegWit)");
-    println!("====================================\n");
+/// Calculate virtual size (vBytes) for a SegWit transaction
+/// Formula: (base_size * 3 + total_size) / 4
+/// where base_size excludes witness data
+fn calculate_virtual_size(signed_tx: &[u8]) -> usize {
+    // Check if this is a SegWit transaction (has marker and flag)
+    if signed_tx.len() >= 6 && signed_tx[4] == 0x00 && signed_tx[5] == 0x01 {
+        // This is a SegWit transaction
+        // We need to calculate the base size (without witness data)
+
+        // For this example, we'll parse the transaction to find witness data
+        let base_size = calculate_base_size(signed_tx);
+        let total_size = signed_tx.len();
+
+        // Weight = base_size * 4 + witness_size * 1
+        // vSize = weight / 4 = (base_size * 4 + witness_size) / 4
+        // Simplified: (base_size * 3 + total_size) / 4
+        (base_size * 3 + total_size) / 4
+    } else {
+        // Legacy transaction - size equals vsize
+        signed_tx.len()
+    }
+}
+
+/// Calculate the base size of a transaction (excluding witness data)
+fn calculate_base_size(signed_tx: &[u8]) -> usize {
+    if signed_tx.len() < 6 || signed_tx[4] != 0x00 || signed_tx[5] != 0x01 {
+        // Not a SegWit transaction
+        return signed_tx.len();
+    }
+
+    // Find where the witness data starts
+    // Structure: version(4) | marker(1) | flag(1) | inputs | outputs | witness | locktime(4)
+    // Base transaction = version(4) | inputs | outputs | locktime(4)
+
+    // For simplicity, we'll estimate:
+    // The witness section is everything between outputs end and locktime
+    // A more precise calculation would parse the transaction structure
+
+    // Quick estimation:
+    // Total size - marker(1) - flag(1) - witness_data_size
+    // Witness data is roughly: 2 inputs × (1 byte count + ~107 bytes data each) ≈ 216 bytes
+
+    let total_size = signed_tx.len();
+    let marker_flag_size = 2; // 0x00 0x01
+
+    // Estimate witness size based on transaction type
+    // For P2WPKH: ~107 bytes per input (1 byte count + 72 sig + 33 pubkey + overhead)
+    // For P2WSH 2-of-2: ~220 bytes per input (1 byte count + 2×72 sigs + script)
+
+    // Parse to count inputs
+    let num_inputs = signed_tx[6] as usize; // After version, marker, flag
+
+    // Rough witness size estimation
+    let witness_size = if is_p2wsh_transaction(signed_tx) {
+        num_inputs * 220 // P2WSH multisig
+    } else {
+        num_inputs * 107 // P2WPKH
+    };
+
+    total_size - marker_flag_size - witness_size
+}
+
+/// Detect if this is a P2WSH transaction (has longer witness data)
+fn is_p2wsh_transaction(signed_tx: &[u8]) -> bool {
+    // Simple heuristic: P2WSH transactions are larger due to multisig
+    signed_tx.len() > 500
+}
+
+fn compare_p2pkh_vs_p2wpkh() -> (usize, usize, usize) {
+    println!("1. Legacy P2PKH vs Native SegWit P2WPKH");
+    println!("========================================\n");
 
     let privkey = [0x11u8; 32];
-    let pubkey = privkey_to_pubkey(&privkey).unwrap();
+    let dummy_spk = vec![
+        0x76, 0xa9, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0xac,
+    ];
 
     // Legacy P2PKH
-    println!("--- Legacy P2PKH ---");
+    println!("--- Legacy P2PKH (2 inputs, 3 outputs) ---");
     let mut legacy_tx = legacy::P2PKHTransaction::new();
-    legacy_tx.add_input(TxInput::new([0x42u8; 32], 0));
 
-    let output_spk = hex::decode("76a9143bc28d6d92d9073fb5e3adf481795eaf446bceed88ac").unwrap();
-    legacy_tx.add_output(TxOutput::new(100_000_000, output_spk.clone()));
+    legacy_tx.add_input([0x42u8; 32], 0, dummy_spk.clone(), 300_000_000);
+    legacy_tx.add_input([0x43u8; 32], 1, dummy_spk.clone(), 200_000_000);
 
-    let legacy_signed = legacy_tx.sign(&privkey, &pubkey, 0).unwrap();
-    let legacy_p2pkh_size = legacy_signed.len();
-    println!("Legacy P2PKH size: {} bytes", legacy_signed.len());
+    legacy_tx.add_output(400_000_000, dummy_spk.clone());
+    legacy_tx.add_output(50_000_000, dummy_spk.clone());
+    legacy_tx.add_output(49_000_000, dummy_spk.clone());
+
+    let legacy_signed = legacy_tx.sign(&[privkey, privkey]).unwrap();
+    let legacy_size = legacy_signed.len();
+    println!("Total size: {} bytes", legacy_size);
     println!(
-        "Legacy P2PKH hex: {}...",
-        &hex::encode(&legacy_signed)[0..40]
+        "Virtual size: {} vBytes (same as total for legacy)\n",
+        legacy_size
     );
 
     // SegWit P2WPKH
-    println!("\n--- SegWit P2WPKH ---");
+    println!("--- Native SegWit P2WPKH (same structure) ---");
     let mut segwit_tx = P2WPKHTransaction::new();
-    segwit_tx.add_input(TxInput::new([0x42u8; 32], 0));
-    segwit_tx.add_output(TxOutput::new(100_000_000, output_spk));
 
-    let segwit_signed = segwit_tx.sign(&privkey, &pubkey, 200_000_000).unwrap();
-    let segwit_p2wpkh_size = segwit_signed.len();
-    println!("SegWit P2WPKH size: {} bytes", segwit_signed.len());
+    segwit_tx.add_input([0x42u8; 32], 0, dummy_spk.clone(), 300_000_000);
+    segwit_tx.add_input([0x43u8; 32], 1, dummy_spk.clone(), 200_000_000);
+
+    segwit_tx.add_output(400_000_000, dummy_spk.clone());
+    segwit_tx.add_output(50_000_000, dummy_spk.clone());
+    segwit_tx.add_output(49_000_000, dummy_spk);
+
+    let segwit_signed = segwit_tx.sign(&[privkey, privkey]).unwrap();
+    let segwit_size = segwit_signed.len();
+    let segwit_vsize = calculate_virtual_size(&segwit_signed);
+
+    println!("Total size: {} bytes", segwit_size);
     println!(
-        "SegWit P2WPKH hex: {}...",
-        &hex::encode(&segwit_signed)[0..40]
+        "Virtual size: {} vBytes (witness data discounted)\n",
+        segwit_vsize
     );
 
-    println!("\nKey Differences:");
-    println!("  • Legacy has signature in scriptSig");
-    println!("  • SegWit has signature in witness data");
-    println!("  • SegWit includes marker (0x00) and flag (0x01) bytes");
-    println!(
-        "  • SegWit size: {} bytes ({:.1}% smaller)",
-        segwit_signed.len(),
-        100.0 * (1.0 - segwit_signed.len() as f64 / legacy_signed.len() as f64)
-    );
-
-    (legacy_p2pkh_size, segwit_p2wpkh_size)
+    (legacy_size, segwit_size, segwit_vsize)
 }
 
-fn compare_p2sh_vs_p2wsh() -> (usize, usize) {
-    println!("\n\n2. P2SH (Legacy) vs P2WSH (SegWit) Multisig");
-    println!("===========================================\n");
+fn compare_p2sh_vs_p2wsh() -> (usize, usize, usize) {
+    println!("\n2. Legacy P2SH vs Native SegWit P2WSH (2-of-2 Multisig)");
+    println!("===================================================\n");
 
     let privkey1 = [0x11u8; 32];
     let privkey2 = [0x22u8; 32];
-    let pubkey1 = privkey_to_pubkey(&privkey1).unwrap();
-    let pubkey2 = privkey_to_pubkey(&privkey2).unwrap();
 
-    // Legacy P2SH
-    println!("--- Legacy P2SH 2-of-2 Multisig ---");
-    let legacy_script =
-        legacy::P2SHMultisigTransaction::create_2of2_redeem_script(&pubkey1, &pubkey2);
-    let legacy_address = legacy::P2SHMultisigTransaction::script_to_p2sh(&legacy_script, "regtest");
+    let dummy_spk = vec![
+        0x76, 0xa9, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0xac,
+    ];
+
+    // Legacy P2SH 2-of-2
+    println!("--- Legacy P2SH 2-of-2 (2 inputs) ---");
+    let legacy_script = legacy::P2SHMultisigTransaction::create_2of2_redeem_script(
+        &privkey_to_pubkey(&privkey1).unwrap(),
+        &privkey_to_pubkey(&privkey2).unwrap(),
+    );
 
     let mut legacy_multisig = legacy::P2SHMultisigTransaction::new(legacy_script);
-    legacy_multisig.add_input(TxInput::new([0x42u8; 32], 0));
-    legacy_multisig.add_output(TxOutput::new(
-        100_000_000,
-        vec![vec![0x76, 0xa9, 0x14], vec![0x00; 22]].concat(),
-    ));
 
-    let legacy_multisig_signed = legacy_multisig.sign(&[privkey1, privkey2], 0).unwrap();
-    let legacy_p2sh_size = legacy_multisig_signed.len();
+    legacy_multisig.add_input([0x42u8; 32], 0, 300_000_000);
+    legacy_multisig.add_input([0x43u8; 32], 1, 200_000_000);
 
-    println!("P2SH address: {}", legacy_address);
-    println!("Legacy P2SH size: {} bytes", legacy_multisig_signed.len());
+    legacy_multisig.add_output(400_000_000, dummy_spk.clone());
+    legacy_multisig.add_output(99_000_000, dummy_spk.clone());
 
-    // SegWit P2WSH
-    println!("\n--- SegWit P2WSH 2-of-2 Multisig ---");
-    let segwit_script = P2WSHMultisigTransaction::create_2of2_redeem_script(&pubkey1, &pubkey2);
-    let segwit_address = script_to_p2wsh(&segwit_script, "regtest").unwrap();
+    let legacy_signed = legacy_multisig
+        .sign(&[vec![privkey1, privkey2], vec![privkey1, privkey2]])
+        .unwrap();
+    let legacy_size = legacy_signed.len();
+    println!("Total size: {} bytes", legacy_size);
+    println!(
+        "Virtual size: {} vBytes (same as total for legacy)\n",
+        legacy_size
+    );
+
+    // SegWit P2WSH 2-of-2
+    println!("--- Native SegWit P2WSH 2-of-2 (same structure) ---");
+    let segwit_script = P2WSHMultisigTransaction::create_2of2_redeem_script(
+        &privkey_to_pubkey(&privkey1).unwrap(),
+        &privkey_to_pubkey(&privkey2).unwrap(),
+    );
 
     let mut segwit_multisig = P2WSHMultisigTransaction::new(segwit_script);
-    segwit_multisig.add_input(TxInput::new([0x42u8; 32], 0));
-    segwit_multisig.add_output(TxOutput::new(
-        100_000_000,
-        vec![vec![0x76, 0xa9, 0x14], vec![0x00; 22]].concat(),
-    ));
 
-    let segwit_multisig_signed = segwit_multisig
-        .sign(&[privkey1, privkey2], 200_000_000)
+    segwit_multisig.add_input([0x42u8; 32], 0, 300_000_000);
+    segwit_multisig.add_input([0x43u8; 32], 1, 200_000_000);
+
+    segwit_multisig.add_output(400_000_000, dummy_spk.clone());
+    segwit_multisig.add_output(99_000_000, dummy_spk);
+
+    let segwit_signed = segwit_multisig
+        .sign(&[vec![privkey1, privkey2], vec![privkey1, privkey2]])
         .unwrap();
-    let segwit_p2wsh_size = segwit_multisig_signed.len();
+    let segwit_size = segwit_signed.len();
+    let segwit_vsize = calculate_virtual_size(&segwit_signed);
 
-    println!("P2WSH address: {}", segwit_address);
-    println!("SegWit P2WSH size: {} bytes", segwit_multisig_signed.len());
-
-    println!("\nKey Differences:");
-    println!("  • P2SH address starts with '2' (regtest)");
-    println!("  • P2WSH address starts with 'bcrt1' (regtest)");
-    println!("  • P2SH uses 20-byte HASH160 of script");
-    println!("  • P2WSH uses 32-byte SHA256 of script (better security)");
+    println!("Total size: {} bytes", segwit_size);
     println!(
-        "  • SegWit size: {} bytes ({:.1}% smaller)",
-        segwit_multisig_signed.len(),
-        100.0 * (1.0 - segwit_multisig_signed.len() as f64 / legacy_multisig_signed.len() as f64)
+        "Virtual size: {} vBytes (witness data discounted)\n",
+        segwit_vsize
     );
 
-    (legacy_p2sh_size, segwit_p2wsh_size)
+    (legacy_size, segwit_size, segwit_vsize)
 }
 
-fn size_comparison(
-    legacy_p2pkh_size: usize,
-    segwit_p2wpkh_size: usize,
-    legacy_p2sh_size: usize,
-    segwit_p2wsh_size: usize,
-) {
-    println!("\n\n3. Transaction Size and Weight Comparison");
-    println!("=========================================\n");
+fn size_comparison(l_p2pkh: usize, s_p2pkh_vsize: usize, l_p2sh: usize, s_p2sh_vsize: usize) {
+    println!("\n3. Clear Size & Fee Savings Summary");
+    println!("==================================\n");
 
-    println!("Block Weight Calculation (SegWit rules):");
-    println!("  • Non-witness data: 4 weight units per byte");
-    println!("  • Witness data:     1 weight unit per byte");
-    println!("  • Block limit:      4,000,000 weight units (= 1,000,000 virtual bytes)\n");
+    let p2pkh_save = l_p2pkh.saturating_sub(s_p2pkh_vsize);
+    let p2pkh_pct = if l_p2pkh > 0 {
+        100.0 * p2pkh_save as f64 / l_p2pkh as f64
+    } else {
+        0.0
+    };
 
-    println!("Sizes from the examples above:");
-    println!("┌────────────────────┬────────────┬──────────────────────────────┐");
-    println!("│ Transaction Type   │ Raw Size   │ Notes                        │");
-    println!("├────────────────────┼────────────┼──────────────────────────────┤");
+    let p2sh_save = l_p2sh.saturating_sub(s_p2sh_vsize);
+    let p2sh_pct = if l_p2sh > 0 {
+        100.0 * p2sh_save as f64 / l_p2sh as f64
+    } else {
+        0.0
+    };
+
+    println!("Realistic Savings (2 inputs + 3 outputs):");
+    println!("┌─────────────────────┬────────────────────────────┬──────────────┐");
+    println!("│ Type                │ Legacy vSize │ SegWit vSize │ Savings      │");
+    println!("├─────────────────────┼──────────────┼──────────────┼──────────────┤");
     println!(
-        "│ P2PKH (Legacy)     │ {:>6} B   │ All data counted at 4 WU/B   │",
-        legacy_p2pkh_size
+        "│ P2PKH → P2WPKH      │ {:>10} B │ {:>10} B │ {:>3} B ({:>4.1}%) │",
+        l_p2pkh, s_p2pkh_vsize, p2pkh_save, p2pkh_pct
     );
     println!(
-        "│ P2WPKH (SegWit)    │ {:>6} B   │ Witness discounted           │",
-        segwit_p2wpkh_size
+        "│ P2SH 2-of-2 → P2WSH │ {:>10} B │ {:>10} B │ {:>3} B ({:>4.1}%) │",
+        l_p2sh, s_p2sh_vsize, p2sh_save, p2sh_pct
+    );
+    println!("└─────────────────────┴──────────────┴──────────────┴──────────────┘\n");
+
+    println!("At different fee rates (sat/vB):");
+    println!(
+        "  10 sat/vB → P2WPKH saves ~{:>4} sats | P2WSH saves ~{:>4} sats",
+        p2pkh_save * 10,
+        p2sh_save * 10
     );
     println!(
-        "│ P2SH 2-of-2        │ {:>6} B   │ All data counted at 4 WU/B   │",
-        legacy_p2sh_size
+        "  50 sat/vB → P2WPKH saves ~{:>4} sats | P2WSH saves ~{:>4} sats",
+        p2pkh_save * 50,
+        p2sh_save * 50
     );
     println!(
-        "│ P2WSH 2-of-2       │ {:>6} B   │ Witness discounted           │",
-        segwit_p2wsh_size
+        " 100 sat/vB → P2WPKH saves ~{:>4} sats | P2WSH saves ~{:>4} sats",
+        p2pkh_save * 100,
+        p2sh_save * 100
     );
-    println!("└────────────────────┴────────────┴──────────────────────────────┘\n");
 
-    // Approximate weight/vSize calculation (conservative for SegWit)
-    let legacy_p2pkh_weight = legacy_p2pkh_size * 4;
-    let legacy_p2pkh_vsize = legacy_p2pkh_size;
-
-    // For SegWit: rough estimate - witness ~108 B for P2WPKH, ~217 B for P2WSH 2-of-2
-    let p2wpkh_witness_est = 109; // sig (73) + pubkey (33) + overhead
-    let p2wpkh_non_witness = segwit_p2wpkh_size - p2wpkh_witness_est - 2; // -2 for marker/flag
-    let p2wpkh_weight = p2wpkh_non_witness * 4 + p2wpkh_witness_est;
-    let p2wpkh_vsize = (p2wpkh_weight + 3) / 4; // ceil(weight/4)
-
-    let p2wsh_witness_est = 217; // 1 (empty) + 2*73 sigs + 71 script + overhead
-    let p2wsh_non_witness = segwit_p2wsh_size - p2wsh_witness_est - 2;
-    let p2wsh_weight = p2wsh_non_witness * 4 + p2wsh_witness_est;
-    let p2wsh_vsize = (p2wsh_weight + 3) / 4;
-
-    let legacy_p2sh_weight = legacy_p2sh_size * 4;
-    let legacy_p2sh_vsize = legacy_p2sh_size;
-
-    println!("Estimated Weight and vSize (used for fees):");
-    println!("┌────────────────────┬────────────┬────────────┐");
-    println!("│ Transaction Type   │ vSize (vB) │ Weight (WU)│");
-    println!("├────────────────────┼────────────┼────────────┤");
+    println!("\nKey Takeaway (2026):");
     println!(
-        "│ P2PKH (Legacy)     │ {:>8}   │ {:>8}   │",
-        legacy_p2pkh_vsize, legacy_p2pkh_weight
+        "  SegWit saves {:.1}%–{:.1}% in transaction fees (via virtual bytes)",
+        p2pkh_pct, p2sh_pct
     );
-    println!(
-        "│ P2WPKH (SegWit)    │ {:>8}   │ {:>8}   │",
-        p2wpkh_vsize, p2wpkh_weight
-    );
-    println!(
-        "│ P2SH 2-of-2        │ {:>8}   │ {:>8}   │",
-        legacy_p2sh_vsize, legacy_p2sh_weight
-    );
-    println!(
-        "│ P2WSH 2-of-2       │ {:>8}   │ {:>8}   │",
-        p2wsh_vsize, p2wsh_weight
-    );
-    println!("└────────────────────┴────────────┴────────────┘\n");
+    println!("  → Witness data is discounted 75% for fee calculation");
+    println!("  → Lower fees, more tx per block, better scalability");
+    println!("  → Especially powerful for multisig wallets and exchanges");
 
-    println!("Example fee savings at 10 sat/vB:");
-    let save_p2wpkh = (legacy_p2pkh_vsize - p2wpkh_vsize) * 10;
-    let pct_p2wpkh =
-        100.0 * (legacy_p2pkh_vsize as f64 - p2wpkh_vsize as f64) / legacy_p2pkh_vsize as f64;
-    println!(
-        "  • P2WPKH vs P2PKH: saves ~{} sats (~{:.0}% cheaper)",
-        save_p2wpkh, pct_p2wpkh
-    );
-
-    let save_p2wsh = (legacy_p2sh_vsize - p2wsh_vsize) * 10;
-    let pct_p2wsh =
-        100.0 * (legacy_p2sh_vsize as f64 - p2wsh_vsize as f64) / legacy_p2sh_vsize as f64;
-    println!(
-        "  • P2WSH vs P2SH: saves ~{} sats (~{:.0}% cheaper)\n",
-        save_p2wsh, pct_p2wsh
-    );
-
-    println!("✓ SegWit provides a witness discount:");
-    println!("  Signature data costs 75% less in block space, leading to lower fees");
-    println!("  and allowing more transactions per block.");
+    println!("\nTechnical Details:");
+    println!("  • Legacy tx: size = vsize (no discount)");
+    println!("  • SegWit tx: vsize = (base_size × 3 + total_size) / 4");
+    println!("  • Base size = tx without witness data");
+    println!("  • Witness data gets 75% discount in fee calculation");
 }

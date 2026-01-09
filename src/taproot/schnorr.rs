@@ -42,7 +42,7 @@ pub fn schnorr_verify(
 
 /// Compute taptweak for a public key (BIP341)
 /// taptweak = tagged_hash("TapTweak", pubkey || merkle_root)
-pub fn compute_taptweak(internal_pubkey: &[u8], merkle_root: Option<&[u8]>) -> [u8; 32] {
+pub fn compute_taptweak(internal_pubkey: &[u8], merkle_root: Option<&[u8; 32]>) -> [u8; 32] {
     let mut data = internal_pubkey.to_vec();
     if let Some(root) = merkle_root {
         data.extend_from_slice(root);
@@ -55,7 +55,7 @@ pub fn compute_taptweak(internal_pubkey: &[u8], merkle_root: Option<&[u8]>) -> [
 /// (i.e., if normalization flipped it)
 pub fn taproot_tweak_pubkey(
     internal_pubkey: &[u8],
-    merkle_root: Option<&[u8]>,
+    merkle_root: Option<&[u8; 32]>,
 ) -> Result<(bool, Vec<u8>), Box<dyn std::error::Error>> {
     let secp = Secp256k1::new();
     let internal_key = XOnlyPublicKey::from_slice(internal_pubkey)?;
@@ -75,7 +75,7 @@ pub fn taproot_tweak_pubkey(
 /// Returns the tweaked private key that corresponds exactly to the even-Y output pubkey
 pub fn taproot_tweak_privkey(
     internal_privkey: &[u8; 32],
-    merkle_root: Option<&[u8]>,
+    merkle_root: Option<&[u8; 32]>,
 ) -> Result<[u8; 32], Box<dyn std::error::Error>> {
     let secp = Secp256k1::new();
 

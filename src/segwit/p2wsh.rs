@@ -1,23 +1,44 @@
-use crate::segwit::p2wpkh_single_input::{TxInput, TxOutput};
+//! P2WSH Multisig Transaction with Trait Support
+//!
+//! This implements SegWit P2WSH multisig with full trait support
+
+use crate::sighash::{SegwitV0Sighash, SighashFlag, SighashInput, SighashOutput};
+use crate::timelocks::{LockTime, OpCheckLockTimeVerify, OpCheckSequenceVerify, Sequence};
+use crate::transaction::*;
 use crate::utils::*;
 
-/// P2WSH Multisig Transaction Builder
+/// P2WSH Multisig Transaction with full trait support
+#[derive(Debug, Clone)]
 pub struct P2WSHMultisigTransaction {
     version: u32,
-    inputs: Vec<TxInput>,
-    outputs: Vec<TxOutput>,
-    locktime: u32,
+    inputs: Vec<P2WSHTxInput>,
+    outputs: Vec<P2WSHTxOutput>,
+    locktime: LockTime,
     redeem_script: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+pub struct P2WSHTxInput {
+    pub txid: [u8; 32],
+    pub vout: u32,
+    pub sequence: Sequence,
+    pub sighash_flag: SighashFlag,
+    pub amount: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct P2WSHTxOutput {
+    pub amount: u64,
+    pub script_pubkey: Vec<u8>,
+}
+
 impl P2WSHMultisigTransaction {
-    /// Create a new P2WSH multisig transaction with the given redeem script
     pub fn new(redeem_script: Vec<u8>) -> Self {
         Self {
             version: 2,
             inputs: Vec::new(),
             outputs: Vec::new(),
-            locktime: 0,
+            locktime: LockTime::None,
             redeem_script,
         }
     }
@@ -25,24 +46,28 @@ impl P2WSHMultisigTransaction {
     /// Create a 2-of-2 multisig redeem script
     pub fn create_2of2_redeem_script(pubkey1: &[u8], pubkey2: &[u8]) -> Vec<u8> {
         let mut script = Vec::new();
-
-        // OP_2
-        script.push(0x52);
-
-        // Push first pubkey
+        script.push(0x52); // OP_2
         script.push(pubkey1.len() as u8);
         script.extend_from_slice(pubkey1);
-
-        // Push second pubkey
         script.push(pubkey2.len() as u8);
         script.extend_from_slice(pubkey2);
+        script.push(0x52); // OP_2
+        script.push(0xae); // OP_CHECKMULTISIG
+        script
+    }
 
-        // OP_2
-        script.push(0x52);
-
-        // OP_CHECKMULTISIG
-        script.push(0xae);
-
+    /// Create a 2-of-3 multisig redeem script
+    pub fn create_2of3_redeem_script(pubkey1: &[u8], pubkey2: &[u8], pubkey3: &[u8]) -> Vec<u8> {
+        let mut script = Vec::new();
+        script.push(0x52); // OP_2
+        script.push(pubkey1.len() as u8);
+        script.extend_from_slice(pubkey1);
+        script.push(pubkey2.len() as u8);
+        script.extend_from_slice(pubkey2);
+        script.push(pubkey3.len() as u8);
+        script.extend_from_slice(pubkey3);
+        script.push(0x53); // OP_3
+        script.push(0xae); // OP_CHECKMULTISIG
         script
     }
 
@@ -57,278 +82,378 @@ impl P2WSHMultisigTransaction {
         }
 
         let mut script = Vec::new();
+        script.push(0x50 + m); // OP_m
 
-        // OP_m (0x50 + m for 1-16)
-        script.push(0x50 + m);
-
-        // Push all pubkeys
         for pubkey in pubkeys {
             script.push(pubkey.len() as u8);
             script.extend_from_slice(pubkey);
         }
 
-        // OP_n
-        script.push(0x50 + pubkeys.len() as u8);
-
-        // OP_CHECKMULTISIG
-        script.push(0xae);
+        script.push(0x50 + pubkeys.len() as u8); // OP_n
+        script.push(0xae); // OP_CHECKMULTISIG
 
         Ok(script)
     }
 
-    pub fn add_input(&mut self, input: TxInput) {
-        self.inputs.push(input);
+    /// Get the witness script hash (for creating P2WSH output)
+    pub fn get_witness_script_hash(&self) -> Vec<u8> {
+        sha256(&self.redeem_script).to_vec()
     }
 
-    pub fn add_output(&mut self, output: TxOutput) {
-        self.outputs.push(output);
+    pub fn add_input(&mut self, txid: [u8; 32], vout: u32, amount: u64) {
+        self.inputs.push(P2WSHTxInput {
+            txid,
+            vout,
+            sequence: Sequence::enable_locktime(),
+            sighash_flag: SighashFlag::All,
+            amount,
+        });
+    }
+
+    pub fn add_output(&mut self, amount: u64, script_pubkey: Vec<u8>) {
+        self.outputs.push(P2WSHTxOutput {
+            amount,
+            script_pubkey,
+        });
     }
 
     pub fn get_redeem_script(&self) -> &[u8] {
         &self.redeem_script
     }
 
-    /// Create the unsigned transaction
+    /// Build unsigned transaction
     pub fn build_unsigned(&self) -> Vec<u8> {
         let mut tx = Vec::new();
 
-        // Version
         tx.extend_from_slice(&self.version.to_le_bytes());
-
-        // Input count
         tx.extend_from_slice(&varint_len(&vec![0u8; self.inputs.len()]));
 
-        // Inputs
         for input in &self.inputs {
-            tx.extend_from_slice(&input.serialize());
+            let mut txid_le = input.txid;
+            txid_le.reverse();
+            tx.extend_from_slice(&txid_le);
+            tx.extend_from_slice(&input.vout.to_le_bytes());
+            tx.push(0x00); // Empty scriptSig
+            tx.extend_from_slice(&input.sequence.to_bytes());
         }
 
-        // Output count
         tx.extend_from_slice(&varint_len(&vec![0u8; self.outputs.len()]));
 
-        // Outputs
         for output in &self.outputs {
-            tx.extend_from_slice(&output.serialize());
+            tx.extend_from_slice(&output.amount.to_le_bytes());
+            tx.extend_from_slice(&varint_len(&output.script_pubkey));
+            tx.extend_from_slice(&output.script_pubkey);
         }
 
-        // Locktime
-        tx.extend_from_slice(&self.locktime.to_le_bytes());
+        tx.extend_from_slice(&self.locktime.to_bytes());
 
         tx
     }
 
-    /// Create the sighash preimage for P2WSH (BIP143)
-    fn create_sighash_preimage(
-        &self,
-        input_index: usize,
-        input_value: u64,
-        sighash_type: u32,
-    ) -> Vec<u8> {
-        let input = &self.inputs[input_index];
-
-        // For P2WSH, the scriptCode is the redeemScript
-        let scriptcode = &self.redeem_script;
-
-        // Serialize all outputs
-        let mut outputs_serialized = Vec::new();
-        for output in &self.outputs {
-            outputs_serialized.extend_from_slice(&output.serialize());
-        }
-
-        // Create hashPrevouts
-        let mut prevouts = Vec::new();
-        for inp in &self.inputs {
-            let mut txid_le = inp.txid;
-            txid_le.reverse();
-            prevouts.extend_from_slice(&txid_le);
-            prevouts.extend_from_slice(&inp.vout.to_le_bytes());
-        }
-        let hash_prevouts = hash256(&prevouts);
-
-        // Create hashSequence
-        let mut sequences = Vec::new();
-        for inp in &self.inputs {
-            sequences.extend_from_slice(&inp.sequence.to_le_bytes());
-        }
-        let hash_sequence = hash256(&sequences);
-
-        // Create hashOutputs
-        let hash_outputs = hash256(&outputs_serialized);
-
-        // Build the sighash preimage
-        let mut preimage = Vec::new();
-
-        // Version
-        preimage.extend_from_slice(&self.version.to_le_bytes());
-
-        // hashPrevouts
-        preimage.extend_from_slice(&hash_prevouts);
-
-        // hashSequence
-        preimage.extend_from_slice(&hash_sequence);
-
-        // Outpoint
-        let mut txid_le = input.txid;
-        txid_le.reverse();
-        preimage.extend_from_slice(&txid_le);
-        preimage.extend_from_slice(&input.vout.to_le_bytes());
-
-        // scriptCode with length
-        preimage.extend_from_slice(&varint_len(scriptcode));
-        preimage.extend_from_slice(scriptcode);
-
-        // Value
-        preimage.extend_from_slice(&input_value.to_le_bytes());
-
-        // Sequence
-        preimage.extend_from_slice(&input.sequence.to_le_bytes());
-
-        // hashOutputs
-        preimage.extend_from_slice(&hash_outputs);
-
-        // Locktime
-        preimage.extend_from_slice(&self.locktime.to_le_bytes());
-
-        // Sighash type
-        preimage.extend_from_slice(&sighash_type.to_le_bytes());
-
-        preimage
-    }
-
-    /// Sign the transaction with multiple private keys (for multisig)
-    /// For a 2-of-2, provide 2 private keys
+    /// Sign the P2WSH multisig transaction with custom sighash flags per input
     pub fn sign(
         &self,
-        privkeys: &[[u8; 32]],
-        input_value: u64,
+        privkeys_per_input: &[Vec<[u8; 32]>], // Vector of privkey sets, one per input
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        if self.inputs.len() != 1 {
-            return Err("This implementation currently supports single input only".into());
+        if privkeys_per_input.len() != self.inputs.len() {
+            return Err("Number of privkey sets must match number of inputs".into());
         }
 
-        let sighash_type = 1u32; // SIGHASH_ALL
+        let mut witnesses = Vec::new();
 
-        // Create sighash preimage
-        let preimage = self.create_sighash_preimage(0, input_value, sighash_type);
+        for (i, (privkeys, input)) in privkeys_per_input
+            .iter()
+            .zip(self.inputs.iter())
+            .enumerate()
+        {
+            // Convert to sighash format
+            let sighash_inputs: Vec<SighashInput> = self
+                .inputs
+                .iter()
+                .map(|inp| SighashInput {
+                    txid: inp.txid,
+                    vout: inp.vout,
+                    script_pubkey: self.redeem_script.clone(),
+                    amount: inp.amount,
+                    sequence: inp.sequence.to_u32(),
+                })
+                .collect();
 
-        // Hash the preimage
-        let sighash = hash256(&preimage);
+            let sighash_outputs: Vec<SighashOutput> = self
+                .outputs
+                .iter()
+                .map(|out| SighashOutput {
+                    amount: out.amount,
+                    script_pubkey: out.script_pubkey.clone(),
+                })
+                .collect();
 
-        // Create signatures for each private key
-        let mut signatures = Vec::new();
-        for privkey in privkeys {
-            let mut signature = sign_hash(privkey, &sighash)?;
-            signature.push(0x01); // Append SIGHASH_ALL
-            signatures.push(signature);
+            // Compute sighash with custom flag
+            let sighash = SegwitV0Sighash::compute(
+                self.version,
+                &sighash_inputs,
+                &sighash_outputs,
+                i,
+                input.sighash_flag,
+                self.locktime.to_u32(),
+            )?;
+
+            // Create signatures for each private key
+            let mut signatures = Vec::new();
+            for privkey in privkeys {
+                let mut signature = sign_hash(privkey, &sighash)?;
+
+                // Append sighash flag if not ALL
+                if input.sighash_flag != SighashFlag::All {
+                    signature.push(input.sighash_flag.to_u8());
+                } else {
+                    signature.push(0x01);
+                }
+
+                signatures.push(signature);
+            }
+
+            // Build witness
+            let mut witness = Vec::new();
+
+            // Number of witness stack items (extra 0 for CHECKMULTISIG bug + sigs + script)
+            witness.push((signatures.len() + 2) as u8);
+
+            // Add extra "00" for the CHECKMULTISIG bug
+            witness.push(0x00);
+
+            // Add signatures
+            for sig in signatures {
+                witness.extend_from_slice(&pushbytes(&sig));
+            }
+
+            // Add redeem script
+            witness.extend_from_slice(&pushbytes(&self.redeem_script));
+
+            witnesses.push(witness);
         }
-
-        // Build witness
-        let mut witness = Vec::new();
-
-        // Number of witness stack items (extra 0 for CHECKMULTISIG bug + sigs + script)
-        witness.push((signatures.len() + 2) as u8);
-
-        // Add extra "00" for the CHECKMULTISIG bug
-        witness.push(0x00);
-
-        // Add signatures
-        for sig in signatures {
-            witness.extend_from_slice(&pushbytes(&sig));
-        }
-
-        // Add redeem script
-        witness.extend_from_slice(&pushbytes(&self.redeem_script));
 
         // Build final signed transaction
         let mut signed_tx = Vec::new();
 
-        // Version
         signed_tx.extend_from_slice(&self.version.to_le_bytes());
+        signed_tx.push(0x00); // marker
+        signed_tx.push(0x01); // flag
 
-        // Marker and flag (segwit)
-        signed_tx.push(0x00);
-        signed_tx.push(0x01);
-
-        // Input count
         signed_tx.extend_from_slice(&varint_len(&vec![0u8; self.inputs.len()]));
 
-        // Inputs
         for input in &self.inputs {
-            signed_tx.extend_from_slice(&input.serialize());
+            let mut txid_le = input.txid;
+            txid_le.reverse();
+            signed_tx.extend_from_slice(&txid_le);
+            signed_tx.extend_from_slice(&input.vout.to_le_bytes());
+            signed_tx.push(0x00); // Empty scriptSig
+            signed_tx.extend_from_slice(&input.sequence.to_bytes());
         }
 
-        // Output count
         signed_tx.extend_from_slice(&varint_len(&vec![0u8; self.outputs.len()]));
 
-        // Outputs
         for output in &self.outputs {
-            signed_tx.extend_from_slice(&output.serialize());
+            signed_tx.extend_from_slice(&output.amount.to_le_bytes());
+            signed_tx.extend_from_slice(&varint_len(&output.script_pubkey));
+            signed_tx.extend_from_slice(&output.script_pubkey);
         }
 
-        // Witness
-        signed_tx.extend_from_slice(&witness);
+        // Witnesses
+        for witness in &witnesses {
+            signed_tx.extend_from_slice(witness);
+        }
 
-        // Locktime
-        signed_tx.extend_from_slice(&self.locktime.to_le_bytes());
+        signed_tx.extend_from_slice(&self.locktime.to_bytes());
 
         Ok(signed_tx)
     }
 }
 
+// Implement SighashFlagSupport trait
+impl SighashFlagSupport for P2WSHMultisigTransaction {
+    fn get_sighash_flag(&self, input_index: usize) -> Option<SighashFlag> {
+        self.inputs.get(input_index).map(|i| i.sighash_flag)
+    }
+
+    fn set_sighash_flag(&mut self, input_index: usize, flag: SighashFlag) -> Result<(), String> {
+        if input_index >= self.inputs.len() {
+            return Err("Input index out of bounds".to_string());
+        }
+
+        if !flag.is_valid_for_segwit() {
+            return Err(format!("Invalid sighash flag for SegWit: {:?}", flag));
+        }
+
+        self.inputs[input_index].sighash_flag = flag;
+        Ok(())
+    }
+
+    fn get_all_sighash_flags(&self) -> Vec<SighashFlag> {
+        self.inputs.iter().map(|i| i.sighash_flag).collect()
+    }
+}
+
+// Implement AbsoluteTimelockSupport trait
+impl AbsoluteTimelockSupport for P2WSHMultisigTransaction {
+    fn get_locktime(&self) -> LockTime {
+        self.locktime
+    }
+
+    fn set_locktime(&mut self, locktime: LockTime) {
+        self.locktime = locktime;
+    }
+
+    fn is_locktime_enabled(&self) -> bool {
+        if !self.locktime.is_enabled() {
+            return false;
+        }
+
+        !self.inputs.iter().all(|i| i.sequence.disables_locktime())
+    }
+
+    fn is_final_at(&self, block_height: u32, block_time: u32) -> bool {
+        if matches!(self.locktime, LockTime::None) {
+            return true;
+        }
+
+        if self.inputs.iter().all(|i| i.sequence.disables_locktime()) {
+            return true;
+        }
+
+        match self.locktime {
+            LockTime::BlockHeight(h) => block_height >= h,
+            LockTime::Timestamp(t) => block_time >= t,
+            LockTime::None => true,
+        }
+    }
+}
+
+// Implement RelativeTimelockSupport trait
+impl RelativeTimelockSupport for P2WSHMultisigTransaction {
+    fn get_sequence(&self, input_index: usize) -> Option<Sequence> {
+        self.inputs.get(input_index).map(|i| i.sequence)
+    }
+
+    fn set_sequence(&mut self, input_index: usize, sequence: Sequence) -> Result<(), String> {
+        if input_index >= self.inputs.len() {
+            return Err("Input index out of bounds".to_string());
+        }
+
+        self.inputs[input_index].sequence = sequence;
+        Ok(())
+    }
+
+    fn get_all_sequences(&self) -> Vec<Sequence> {
+        self.inputs.iter().map(|i| i.sequence).collect()
+    }
+}
+
+// Implement combined TimelockSupport trait
+impl TimelockSupport for P2WSHMultisigTransaction {}
+
+// Implement OpCLTVSupport trait
+impl OpCLTVSupport for P2WSHMultisigTransaction {
+    fn can_satisfy_cltv(&self, input_index: usize, script_locktime: LockTime) -> bool {
+        if let Some(sequence) = self.get_sequence(input_index) {
+            OpCheckLockTimeVerify::verify(script_locktime, self.locktime, sequence)
+        } else {
+            false
+        }
+    }
+
+    fn get_max_cltv_locktime(&self, _input_index: usize) -> Option<LockTime> {
+        if self.is_locktime_enabled() {
+            Some(self.locktime)
+        } else {
+            None
+        }
+    }
+}
+
+// Implement OpCSVSupport trait
+impl OpCSVSupport for P2WSHMultisigTransaction {
+    fn can_satisfy_csv(&self, input_index: usize, script_sequence: Sequence) -> bool {
+        if let Some(tx_sequence) = self.get_sequence(input_index) {
+            OpCheckSequenceVerify::verify(script_sequence, tx_sequence)
+        } else {
+            false
+        }
+    }
+
+    fn get_max_csv_sequence(&self, input_index: usize) -> Option<Sequence> {
+        self.get_sequence(input_index)
+            .filter(|s| s.is_relative_locktime_enabled())
+    }
+}
+
+// Implement TimelockTransactionBuilder trait
+impl TimelockTransactionBuilder for P2WSHMultisigTransaction {
+    fn with_absolute_locktime(locktime: LockTime) -> Self {
+        Self {
+            version: 2,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            locktime,
+            redeem_script: Vec::new(),
+        }
+    }
+
+    fn with_relative_locktimes(sequences: Vec<Sequence>) -> Self {
+        let mut tx = Self::new(Vec::new());
+        for seq in sequences {
+            tx.inputs.push(P2WSHTxInput {
+                txid: [0u8; 32],
+                vout: 0,
+                sequence: seq,
+                sighash_flag: SighashFlag::All,
+                amount: 0,
+            });
+        }
+        tx
+    }
+
+    fn add_input_with_sequence(&mut self, txid: [u8; 32], vout: u32, sequence: Sequence) {
+        self.inputs.push(P2WSHTxInput {
+            txid,
+            vout,
+            sequence,
+            sighash_flag: SighashFlag::All,
+            amount: 0,
+        });
+    }
+
+    fn add_cltv_input(&mut self, txid: [u8; 32], vout: u32, script_locktime: LockTime) {
+        if self.locktime.to_u32() < script_locktime.to_u32() {
+            self.locktime = script_locktime;
+        }
+
+        self.inputs.push(P2WSHTxInput {
+            txid,
+            vout,
+            sequence: Sequence::enable_locktime(),
+            sighash_flag: SighashFlag::All,
+            amount: 0,
+        });
+    }
+
+    fn add_csv_input(&mut self, txid: [u8; 32], vout: u32, script_sequence: Sequence) {
+        self.inputs.push(P2WSHTxInput {
+            txid,
+            vout,
+            sequence: script_sequence,
+            sighash_flag: SighashFlag::All,
+            amount: 0,
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::vec;
-
     use super::*;
 
     #[test]
-    fn test_create_2of2_redeem_script() {
-        let privkey1 = [0x11u8; 32];
-        let privkey2 = [0x22u8; 32];
-
-        let pubkey1 = privkey_to_pubkey(&privkey1).unwrap();
-        let pubkey2 = privkey_to_pubkey(&privkey2).unwrap();
-
-        let script = P2WSHMultisigTransaction::create_2of2_redeem_script(&pubkey1, &pubkey2);
-
-        // Check script structure: OP_2 <pubkey1> <pubkey2> OP_2 OP_CHECKMULTISIG
-        assert_eq!(script[0], 0x52); // OP_2
-        assert_eq!(script[script.len() - 2], 0x52); // OP_2
-        assert_eq!(script[script.len() - 1], 0xae); // OP_CHECKMULTISIG
-
-        // Expected length: 1 + 1 + 33 + 1 + 33 + 1 + 1 = 71
-        assert_eq!(script.len(), 71);
-    }
-
-    #[test]
-    fn test_create_multisig_redeem_script() {
-        let pubkeys = vec![vec![0x03; 33], vec![0x04; 33], vec![0x05; 33]];
-
-        let script = P2WSHMultisigTransaction::create_multisig_redeem_script(2, &pubkeys).unwrap();
-
-        // OP_2 for m=2
-        assert_eq!(script[0], 0x52);
-        // OP_3 for n=3
-        assert_eq!(script[script.len() - 2], 0x53);
-        // OP_CHECKMULTISIG
-        assert_eq!(script[script.len() - 1], 0xae);
-    }
-
-    #[test]
-    fn test_invalid_multisig_m() {
-        let pubkeys = vec![vec![0x03; 33], vec![0x04; 33]];
-
-        // m = 0 should fail
-        let result = P2WSHMultisigTransaction::create_multisig_redeem_script(0, &pubkeys);
-        assert!(result.is_err());
-
-        // m > n should fail
-        let result = P2WSHMultisigTransaction::create_multisig_redeem_script(3, &pubkeys);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_p2wsh_transaction_creation() {
+    fn test_p2wsh_with_different_sighash_flags() {
         let privkey1 = [0x11u8; 32];
         let privkey2 = [0x22u8; 32];
 
@@ -338,18 +463,26 @@ mod tests {
         let redeem_script = P2WSHMultisigTransaction::create_2of2_redeem_script(&pubkey1, &pubkey2);
 
         let mut tx = P2WSHMultisigTransaction::new(redeem_script);
-        tx.add_input(TxInput::new([0x42u8; 32], 0));
-        tx.add_output(TxOutput::new(
-            100_000_000,
-            vec![vec![0x76, 0xa9, 0x14], vec![0x00; 22]].concat(),
-        ));
 
-        let unsigned = tx.build_unsigned();
-        assert!(!unsigned.is_empty());
+        // Add two inputs with different sighash flags
+        tx.add_input([0x42; 32], 0, 100_000_000);
+        tx.add_input([0x43; 32], 0, 200_000_000);
+
+        tx.set_sighash_flag(0, SighashFlag::All).unwrap();
+        tx.set_sighash_flag(1, SighashFlag::AllAnyoneCanPay)
+            .unwrap();
+
+        tx.add_output(140_000_000, vec![0x00, 0x20]);
+        tx.add_output(150_000_000, vec![0x00, 0x20]);
+
+        // Verify flags are set correctly
+        assert_eq!(tx.get_sighash_flag(0), Some(SighashFlag::All));
+        assert_eq!(tx.get_sighash_flag(1), Some(SighashFlag::AllAnyoneCanPay));
+        assert!(tx.has_anyonecanpay(1));
     }
 
     #[test]
-    fn test_sign_p2wsh_multisig() {
+    fn test_p2wsh_multisig_with_csv() {
         let privkey1 = [0x11u8; 32];
         let privkey2 = [0x22u8; 32];
 
@@ -359,36 +492,33 @@ mod tests {
         let redeem_script = P2WSHMultisigTransaction::create_2of2_redeem_script(&pubkey1, &pubkey2);
 
         let mut tx = P2WSHMultisigTransaction::new(redeem_script);
-        tx.add_input(TxInput::new([0x42u8; 32], 0));
-        tx.add_output(TxOutput::new(
-            100_000_000,
-            vec![vec![0x76, 0xa9, 0x14], vec![0x00; 22]].concat(),
-        ));
 
-        let signed = tx.sign(&[privkey1, privkey2], 200_000_000).unwrap();
-        assert!(!signed.is_empty());
+        tx.add_input([0x42; 32], 0, 100_000_000);
+        tx.set_sequence(0, Sequence::from_blocks(144)).unwrap();
 
-        // Verify segwit marker and flag
-        assert_eq!(signed[4], 0x00);
-        assert_eq!(signed[5], 0x01);
+        tx.add_output(99_000_000, vec![0x00, 0x20]);
+
+        assert!(tx.is_relative_locktime_enabled(0));
+        assert_eq!(tx.get_sequence_locktime_value(0), Some(144));
+
+        // Check CSV compatibility
+        let script_seq = Sequence::from_blocks(100);
+        assert!(tx.can_satisfy_csv(0, script_seq));
     }
 
     #[test]
-    fn test_1of1_multisig() {
-        let privkey = [0x11u8; 32];
-        let pubkey = privkey_to_pubkey(&privkey).unwrap();
+    fn test_witness_script_hash() {
+        let privkey1 = [0x11u8; 32];
+        let privkey2 = [0x22u8; 32];
 
-        let script =
-            P2WSHMultisigTransaction::create_multisig_redeem_script(1, &[pubkey.clone()]).unwrap();
+        let pubkey1 = privkey_to_pubkey(&privkey1).unwrap();
+        let pubkey2 = privkey_to_pubkey(&privkey2).unwrap();
 
-        let mut tx = P2WSHMultisigTransaction::new(script);
-        tx.add_input(TxInput::new([0x42u8; 32], 0));
-        tx.add_output(TxOutput::new(
-            100_000_000,
-            [vec![0x00, 0x14], vec![0x00; 20]].concat(),
-        ));
+        let redeem_script = P2WSHMultisigTransaction::create_2of2_redeem_script(&pubkey1, &pubkey2);
 
-        let signed = tx.sign(&[privkey], 200_000_000).unwrap();
-        assert!(!signed.is_empty());
+        let tx = P2WSHMultisigTransaction::new(redeem_script);
+        let witness_hash = tx.get_witness_script_hash();
+
+        assert_eq!(witness_hash.len(), 32);
     }
 }

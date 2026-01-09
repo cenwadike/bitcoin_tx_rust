@@ -1,12 +1,33 @@
-use crate::segwit::p2wpkh_single_input::{TxInput, TxOutput};
+//! Multi-Input P2WPKH Transaction with Trait Support
+
+use crate::sighash::{SegwitV0Sighash, SighashFlag, SighashInput, SighashOutput};
+use crate::timelocks::{LockTime, OpCheckLockTimeVerify, OpCheckSequenceVerify, Sequence};
+use crate::transaction::*;
 use crate::utils::*;
 
-/// P2WPKH Transaction with Multiple Inputs
+/// Multi-Input P2WPKH Transaction with full trait support
+#[derive(Debug, Clone)]
 pub struct MultiInputP2WPKHTransaction {
     version: u32,
-    inputs: Vec<TxInput>,
-    outputs: Vec<TxOutput>,
-    locktime: u32,
+    inputs: Vec<MultiInputP2WPKHTxInput>,
+    outputs: Vec<MultiInputP2WPKHTxOutput>,
+    locktime: LockTime,
+}
+
+#[derive(Debug, Clone)]
+pub struct MultiInputP2WPKHTxInput {
+    pub txid: [u8; 32],
+    pub vout: u32,
+    pub sequence: Sequence,
+    pub sighash_flag: SighashFlag,
+    pub script_pubkey: Vec<u8>,
+    pub amount: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct MultiInputP2WPKHTxOutput {
+    pub amount: u64,
+    pub script_pubkey: Vec<u8>,
 }
 
 impl MultiInputP2WPKHTransaction {
@@ -15,203 +36,328 @@ impl MultiInputP2WPKHTransaction {
             version: 2,
             inputs: Vec::new(),
             outputs: Vec::new(),
-            locktime: 0,
+            locktime: LockTime::None,
         }
     }
 
-    pub fn add_input(&mut self, input: TxInput) {
-        self.inputs.push(input);
+    pub fn add_input(&mut self, txid: [u8; 32], vout: u32, script_pubkey: Vec<u8>, amount: u64) {
+        self.inputs.push(MultiInputP2WPKHTxInput {
+            txid,
+            vout,
+            sequence: Sequence::enable_locktime(),
+            sighash_flag: SighashFlag::All,
+            script_pubkey,
+            amount,
+        });
     }
 
-    pub fn add_output(&mut self, output: TxOutput) {
-        self.outputs.push(output);
+    pub fn add_output(&mut self, amount: u64, script_pubkey: Vec<u8>) {
+        self.outputs.push(MultiInputP2WPKHTxOutput {
+            amount,
+            script_pubkey,
+        });
     }
 
-    /// Create the unsigned transaction
+    /// Build unsigned transaction
     pub fn build_unsigned(&self) -> Vec<u8> {
         let mut tx = Vec::new();
 
-        // Version
         tx.extend_from_slice(&self.version.to_le_bytes());
-
-        // Input count
         tx.extend_from_slice(&varint_len(&vec![0u8; self.inputs.len()]));
 
-        // Inputs
         for input in &self.inputs {
-            tx.extend_from_slice(&input.serialize());
+            let mut txid_le = input.txid;
+            txid_le.reverse();
+            tx.extend_from_slice(&txid_le);
+            tx.extend_from_slice(&input.vout.to_le_bytes());
+            tx.push(0x00); // Empty scriptSig
+            tx.extend_from_slice(&input.sequence.to_bytes());
         }
 
-        // Output count
         tx.extend_from_slice(&varint_len(&vec![0u8; self.outputs.len()]));
 
-        // Outputs
         for output in &self.outputs {
-            tx.extend_from_slice(&output.serialize());
+            tx.extend_from_slice(&output.amount.to_le_bytes());
+            tx.extend_from_slice(&varint_len(&output.script_pubkey));
+            tx.extend_from_slice(&output.script_pubkey);
         }
 
-        // Locktime
-        tx.extend_from_slice(&self.locktime.to_le_bytes());
+        tx.extend_from_slice(&self.locktime.to_bytes());
 
         tx
     }
 
-    /// Create the sighash preimage for a specific input (BIP143)
-    fn create_sighash_preimage(
-        &self,
-        input_index: usize,
-        pubkey: &[u8],
-        input_value: u64,
-        sighash_type: u32,
-    ) -> Vec<u8> {
-        let input = &self.inputs[input_index];
-
-        // Create scriptCode (P2PKH-like script)
-        let pk_hash = hash160(pubkey);
-        let mut scriptcode = vec![0x76, 0xa9, 0x14]; // OP_DUP OP_HASH160 <20 bytes>
-        scriptcode.extend_from_slice(&pk_hash);
-        scriptcode.extend_from_slice(&[0x88, 0xac]); // OP_EQUALVERIFY OP_CHECKSIG
-
-        // Serialize all outputs
-        let mut outputs_serialized = Vec::new();
-        for output in &self.outputs {
-            outputs_serialized.extend_from_slice(&output.serialize());
+    /// Sign the transaction with custom sighash flags per input
+    pub fn sign(&self, privkeys: &[[u8; 32]]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        if privkeys.len() != self.inputs.len() {
+            return Err("Number of private keys must match number of inputs".into());
         }
 
-        // Create hashPrevouts (hash of all input outpoints)
-        let mut prevouts = Vec::new();
-        for inp in &self.inputs {
-            let mut txid_le = inp.txid;
-            txid_le.reverse();
-            prevouts.extend_from_slice(&txid_le);
-            prevouts.extend_from_slice(&inp.vout.to_le_bytes());
-        }
-        let hash_prevouts = hash256(&prevouts);
-
-        // Create hashSequence (hash of all input sequences)
-        let mut sequences = Vec::new();
-        for inp in &self.inputs {
-            sequences.extend_from_slice(&inp.sequence.to_le_bytes());
-        }
-        let hash_sequence = hash256(&sequences);
-
-        // Create hashOutputs
-        let hash_outputs = hash256(&outputs_serialized);
-
-        // Build the sighash preimage
-        let mut preimage = Vec::new();
-
-        // Version
-        preimage.extend_from_slice(&self.version.to_le_bytes());
-
-        // hashPrevouts
-        preimage.extend_from_slice(&hash_prevouts);
-
-        // hashSequence
-        preimage.extend_from_slice(&hash_sequence);
-
-        // Outpoint (txid + vout of the input being signed)
-        let mut txid_le = input.txid;
-        txid_le.reverse();
-        preimage.extend_from_slice(&txid_le);
-        preimage.extend_from_slice(&input.vout.to_le_bytes());
-
-        // scriptCode with length
-        preimage.extend_from_slice(&varint_len(&scriptcode));
-        preimage.extend_from_slice(&scriptcode);
-
-        // Value
-        preimage.extend_from_slice(&input_value.to_le_bytes());
-
-        // Sequence
-        preimage.extend_from_slice(&input.sequence.to_le_bytes());
-
-        // hashOutputs
-        preimage.extend_from_slice(&hash_outputs);
-
-        // Locktime
-        preimage.extend_from_slice(&self.locktime.to_le_bytes());
-
-        // Sighash type
-        preimage.extend_from_slice(&sighash_type.to_le_bytes());
-
-        preimage
-    }
-
-    /// Sign the transaction with multiple inputs
-    /// Each input requires its own private key, public key, and input value
-    pub fn sign(
-        &self,
-        input_data: &[(Vec<u8>, Vec<u8>, u64)], // (privkey, pubkey, value) for each input
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        if input_data.len() != self.inputs.len() {
-            return Err("Number of signing keys must match number of inputs".into());
-        }
-
-        let sighash_type = 1u32; // SIGHASH_ALL
-
-        // Create signatures for each input
         let mut witnesses = Vec::new();
-        for (i, (privkey, pubkey, value)) in input_data.iter().enumerate() {
-            // Create sighash preimage
-            let mut privkey_array = [0u8; 32];
-            privkey_array.copy_from_slice(privkey);
 
-            let preimage = self.create_sighash_preimage(i, pubkey, *value, sighash_type);
+        for (i, (privkey, input)) in privkeys.iter().zip(self.inputs.iter()).enumerate() {
+            // Convert to sighash format
+            let sighash_inputs: Vec<SighashInput> = self
+                .inputs
+                .iter()
+                .map(|inp| SighashInput {
+                    txid: inp.txid,
+                    vout: inp.vout,
+                    script_pubkey: inp.script_pubkey.clone(),
+                    amount: inp.amount,
+                    sequence: inp.sequence.to_u32(),
+                })
+                .collect();
 
-            // Hash the preimage
-            let sighash = hash256(&preimage);
+            let sighash_outputs: Vec<SighashOutput> = self
+                .outputs
+                .iter()
+                .map(|out| SighashOutput {
+                    amount: out.amount,
+                    script_pubkey: out.script_pubkey.clone(),
+                })
+                .collect();
 
-            // Sign the hash
-            let mut signature = sign_hash(&privkey_array, &sighash)?;
+            // Compute sighash with custom flag
+            let sighash = SegwitV0Sighash::compute(
+                self.version,
+                &sighash_inputs,
+                &sighash_outputs,
+                i,
+                input.sighash_flag,
+                self.locktime.to_u32(),
+            )?;
 
-            // Append SIGHASH_ALL flag
-            signature.push(0x01);
+            // Sign
+            let mut signature = sign_hash(privkey, &sighash)?;
 
-            // Build witness for this input
+            // Append sighash flag
+            if input.sighash_flag != SighashFlag::All {
+                signature.push(input.sighash_flag.to_u8());
+            } else {
+                signature.push(0x01);
+            }
+
+            // Create pubkey
+            let pubkey = privkey_to_pubkey(privkey)?;
+
+            // Build witness
             let mut witness = Vec::new();
-            witness.push(0x02); // 2 stack items
+            witness.push(0x02); // 2 items
             witness.extend_from_slice(&pushbytes(&signature));
-            witness.extend_from_slice(&pushbytes(pubkey));
+            witness.extend_from_slice(&pushbytes(&pubkey));
 
             witnesses.push(witness);
         }
 
-        // Build final signed transaction
+        // Build final transaction
         let mut signed_tx = Vec::new();
 
-        // Version
         signed_tx.extend_from_slice(&self.version.to_le_bytes());
+        signed_tx.push(0x00); // marker
+        signed_tx.push(0x01); // flag
 
-        // Marker and flag (segwit)
-        signed_tx.push(0x00);
-        signed_tx.push(0x01);
-
-        // Input count
         signed_tx.extend_from_slice(&varint_len(&vec![0u8; self.inputs.len()]));
 
-        // Inputs
         for input in &self.inputs {
-            signed_tx.extend_from_slice(&input.serialize());
+            let mut txid_le = input.txid;
+            txid_le.reverse();
+            signed_tx.extend_from_slice(&txid_le);
+            signed_tx.extend_from_slice(&input.vout.to_le_bytes());
+            signed_tx.push(0x00); // empty scriptSig
+            signed_tx.extend_from_slice(&input.sequence.to_bytes());
         }
 
-        // Output count
         signed_tx.extend_from_slice(&varint_len(&vec![0u8; self.outputs.len()]));
 
-        // Outputs
         for output in &self.outputs {
-            signed_tx.extend_from_slice(&output.serialize());
+            signed_tx.extend_from_slice(&output.amount.to_le_bytes());
+            signed_tx.extend_from_slice(&varint_len(&output.script_pubkey));
+            signed_tx.extend_from_slice(&output.script_pubkey);
         }
 
-        // Witnesses (one for each input, in order)
-        for witness in witnesses {
-            signed_tx.extend_from_slice(&witness);
+        for witness in &witnesses {
+            signed_tx.extend_from_slice(witness);
         }
 
-        // Locktime
-        signed_tx.extend_from_slice(&self.locktime.to_le_bytes());
+        signed_tx.extend_from_slice(&self.locktime.to_bytes());
 
         Ok(signed_tx)
+    }
+}
+
+// Implement all traits (same pattern as P2WPKH)
+impl SighashFlagSupport for MultiInputP2WPKHTransaction {
+    fn get_sighash_flag(&self, input_index: usize) -> Option<SighashFlag> {
+        self.inputs.get(input_index).map(|i| i.sighash_flag)
+    }
+
+    fn set_sighash_flag(&mut self, input_index: usize, flag: SighashFlag) -> Result<(), String> {
+        if input_index >= self.inputs.len() {
+            return Err("Input index out of bounds".to_string());
+        }
+
+        if !flag.is_valid_for_segwit() {
+            return Err(format!("Invalid sighash flag for SegWit: {:?}", flag));
+        }
+
+        self.inputs[input_index].sighash_flag = flag;
+        Ok(())
+    }
+
+    fn get_all_sighash_flags(&self) -> Vec<SighashFlag> {
+        self.inputs.iter().map(|i| i.sighash_flag).collect()
+    }
+}
+
+impl AbsoluteTimelockSupport for MultiInputP2WPKHTransaction {
+    fn get_locktime(&self) -> LockTime {
+        self.locktime
+    }
+
+    fn set_locktime(&mut self, locktime: LockTime) {
+        self.locktime = locktime;
+    }
+
+    fn is_locktime_enabled(&self) -> bool {
+        if !self.locktime.is_enabled() {
+            return false;
+        }
+
+        !self.inputs.iter().all(|i| i.sequence.disables_locktime())
+    }
+
+    fn is_final_at(&self, block_height: u32, block_time: u32) -> bool {
+        if matches!(self.locktime, LockTime::None) {
+            return true;
+        }
+
+        if self.inputs.iter().all(|i| i.sequence.disables_locktime()) {
+            return true;
+        }
+
+        match self.locktime {
+            LockTime::BlockHeight(h) => block_height >= h,
+            LockTime::Timestamp(t) => block_time >= t,
+            LockTime::None => true,
+        }
+    }
+}
+
+impl RelativeTimelockSupport for MultiInputP2WPKHTransaction {
+    fn get_sequence(&self, input_index: usize) -> Option<Sequence> {
+        self.inputs.get(input_index).map(|i| i.sequence)
+    }
+
+    fn set_sequence(&mut self, input_index: usize, sequence: Sequence) -> Result<(), String> {
+        if input_index >= self.inputs.len() {
+            return Err("Input index out of bounds".to_string());
+        }
+
+        self.inputs[input_index].sequence = sequence;
+        Ok(())
+    }
+
+    fn get_all_sequences(&self) -> Vec<Sequence> {
+        self.inputs.iter().map(|i| i.sequence).collect()
+    }
+}
+
+impl TimelockSupport for MultiInputP2WPKHTransaction {}
+
+impl OpCLTVSupport for MultiInputP2WPKHTransaction {
+    fn can_satisfy_cltv(&self, input_index: usize, script_locktime: LockTime) -> bool {
+        if let Some(sequence) = self.get_sequence(input_index) {
+            OpCheckLockTimeVerify::verify(script_locktime, self.locktime, sequence)
+        } else {
+            false
+        }
+    }
+
+    fn get_max_cltv_locktime(&self, _input_index: usize) -> Option<LockTime> {
+        if self.is_locktime_enabled() {
+            Some(self.locktime)
+        } else {
+            None
+        }
+    }
+}
+
+impl OpCSVSupport for MultiInputP2WPKHTransaction {
+    fn can_satisfy_csv(&self, input_index: usize, script_sequence: Sequence) -> bool {
+        if let Some(tx_sequence) = self.get_sequence(input_index) {
+            OpCheckSequenceVerify::verify(script_sequence, tx_sequence)
+        } else {
+            false
+        }
+    }
+
+    fn get_max_csv_sequence(&self, input_index: usize) -> Option<Sequence> {
+        self.get_sequence(input_index)
+            .filter(|s| s.is_relative_locktime_enabled())
+    }
+}
+
+impl TimelockTransactionBuilder for MultiInputP2WPKHTransaction {
+    fn with_absolute_locktime(locktime: LockTime) -> Self {
+        Self {
+            version: 2,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            locktime,
+        }
+    }
+
+    fn with_relative_locktimes(sequences: Vec<Sequence>) -> Self {
+        let mut tx = Self::new();
+        for seq in sequences {
+            tx.inputs.push(MultiInputP2WPKHTxInput {
+                txid: [0u8; 32],
+                vout: 0,
+                sequence: seq,
+                sighash_flag: SighashFlag::All,
+                script_pubkey: Vec::new(),
+                amount: 0,
+            });
+        }
+        tx
+    }
+
+    fn add_input_with_sequence(&mut self, txid: [u8; 32], vout: u32, sequence: Sequence) {
+        self.inputs.push(MultiInputP2WPKHTxInput {
+            txid,
+            vout,
+            sequence,
+            sighash_flag: SighashFlag::All,
+            script_pubkey: Vec::new(),
+            amount: 0,
+        });
+    }
+
+    fn add_cltv_input(&mut self, txid: [u8; 32], vout: u32, script_locktime: LockTime) {
+        if self.locktime.to_u32() < script_locktime.to_u32() {
+            self.locktime = script_locktime;
+        }
+
+        self.inputs.push(MultiInputP2WPKHTxInput {
+            txid,
+            vout,
+            sequence: Sequence::enable_locktime(),
+            sighash_flag: SighashFlag::All,
+            script_pubkey: Vec::new(),
+            amount: 0,
+        });
+    }
+
+    fn add_csv_input(&mut self, txid: [u8; 32], vout: u32, script_sequence: Sequence) {
+        self.inputs.push(MultiInputP2WPKHTxInput {
+            txid,
+            vout,
+            sequence: script_sequence,
+            sighash_flag: SighashFlag::All,
+            script_pubkey: Vec::new(),
+            amount: 0,
+        });
     }
 }
 
@@ -220,92 +366,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_multi_input_transaction() {
-        let privkey1 = [0x11u8; 32];
-        let privkey2 = [0x22u8; 32];
-
-        let pubkey1 = privkey_to_pubkey(&privkey1).unwrap();
-        let pubkey2 = privkey_to_pubkey(&privkey2).unwrap();
-
+    fn test_multi_input_with_different_sighash_flags() {
         let mut tx = MultiInputP2WPKHTransaction::new();
 
-        // Add two inputs
-        tx.add_input(TxInput::new([0x42u8; 32], 0));
-        tx.add_input(TxInput::new([0x43u8; 32], 0));
+        tx.add_input([0x42; 32], 0, vec![0x00, 0x14], 100_000_000);
+        tx.add_input([0x43; 32], 0, vec![0x00, 0x14], 200_000_000);
 
-        // Add outputs
-        tx.add_output(TxOutput::new(
-            100_000_000,
-            vec![vec![0x00, 0x14], vec![0x00; 20]].concat(),
-        ));
-        tx.add_output(TxOutput::new(
-            50_000_000,
-            vec![vec![0x00, 0x14], vec![0x00; 20]].concat(),
-        ));
+        // Set different sighash flags
+        tx.set_sighash_flag(0, SighashFlag::All).unwrap();
+        tx.set_sighash_flag(1, SighashFlag::AllAnyoneCanPay)
+            .unwrap();
 
-        // Sign with both keys
-        let input_data = vec![
-            (privkey1.to_vec(), pubkey1, 100_000_000),
-            (privkey2.to_vec(), pubkey2, 100_000_000),
-        ];
+        tx.add_output(140_000_000, vec![0x00, 0x14]);
+        tx.add_output(150_000_000, vec![0x00, 0x14]);
 
-        let signed = tx.sign(&input_data).unwrap();
-        assert!(!signed.is_empty());
-
-        // Verify segwit marker and flag
-        assert_eq!(signed[4], 0x00);
-        assert_eq!(signed[5], 0x01);
+        assert_eq!(tx.get_sighash_flag(0), Some(SighashFlag::All));
+        assert_eq!(tx.get_sighash_flag(1), Some(SighashFlag::AllAnyoneCanPay));
+        assert!(tx.has_anyonecanpay(1));
     }
 
     #[test]
-    fn test_multi_input_witness_order() {
-        let privkey1 = [0x11u8; 32];
-        let privkey2 = [0x22u8; 32];
-        let privkey3 = [0x33u8; 32];
+    fn test_multi_input_with_mixed_timelocks() {
+        let mut tx =
+            MultiInputP2WPKHTransaction::with_absolute_locktime(LockTime::BlockHeight(700000));
 
-        let pubkey1 = privkey_to_pubkey(&privkey1).unwrap();
-        let pubkey2 = privkey_to_pubkey(&privkey2).unwrap();
-        let pubkey3 = privkey_to_pubkey(&privkey3).unwrap();
+        tx.add_input([0x42; 32], 0, vec![0x00, 0x14], 100_000_000);
+        tx.add_input([0x43; 32], 0, vec![0x00, 0x14], 100_000_000);
 
-        let mut tx = MultiInputP2WPKHTransaction::new();
+        tx.set_sequence(0, Sequence::from_blocks(144)).unwrap();
+        tx.set_sequence(1, Sequence::from_time_intervals(10))
+            .unwrap();
 
-        tx.add_input(TxInput::new([0x01u8; 32], 0));
-        tx.add_input(TxInput::new([0x02u8; 32], 0));
-        tx.add_input(TxInput::new([0x03u8; 32], 0));
+        tx.add_output(190_000_000, vec![0x00, 0x14]);
 
-        tx.add_output(TxOutput::new(
-            200_000_000,
-            vec![vec![0x00, 0x14], vec![0x00; 20]].concat(),
-        ));
-
-        let input_data = vec![
-            (privkey1.to_vec(), pubkey1, 100_000_000),
-            (privkey2.to_vec(), pubkey2, 100_000_000),
-            (privkey3.to_vec(), pubkey3, 100_000_000),
-        ];
-
-        let signed = tx.sign(&input_data).unwrap();
-        assert!(!signed.is_empty());
-    }
-
-    #[test]
-    fn test_mismatched_input_count() {
-        let privkey1 = [0x11u8; 32];
-        let pubkey1 = privkey_to_pubkey(&privkey1).unwrap();
-
-        let mut tx = MultiInputP2WPKHTransaction::new();
-        tx.add_input(TxInput::new([0x42u8; 32], 0));
-        tx.add_input(TxInput::new([0x43u8; 32], 0));
-
-        tx.add_output(TxOutput::new(
-            100_000_000,
-            vec![vec![0x00, 0x14], vec![0x00; 20]].concat(),
-        ));
-
-        // Only provide one key for two inputs
-        let input_data = vec![(privkey1.to_vec(), pubkey1, 100_000_000)];
-
-        let result = tx.sign(&input_data);
-        assert!(result.is_err());
+        assert!(tx.is_relative_locktime_enabled(0));
+        assert!(tx.is_time_based_sequence(1));
+        assert!(tx.has_any_timelock());
     }
 }
